@@ -1,7 +1,7 @@
 import type { CalendarEvent, TodoistTask } from "./types.js";
 import {
   classifyCalendarRule, classifyTodoistRule, recurrenceCadenceMatchesAtDate,
-  recurrenceCivilAnchor, recurrenceIncludesDate, type RecurrenceSemantics,
+  recurrenceCivilAnchor, recurrenceIncludesDate, parseTodoistStartBoundary, type RecurrenceSemantics,
 } from "./recurrence-semantics.js";
 import {
   calendarPhaseCCandidate, calendarPhaseCInstancesConform,
@@ -273,7 +273,8 @@ function scheduleStartMatches(
   phraseKind: WeeklyPhraseKind,
 ): boolean {
   return sameDate(expected.start, observed.start, allowYearOmission)
-    || (phraseKind === "ending_only" && endingOnlyAnchorMatchesSeries(expected, observed));
+    || ((phraseKind === "ending_only" || Boolean(expected.end.year && observed.start.year && observed.end.year))
+      && endingOnlyAnchorMatchesSeries(expected, observed));
 }
 
 function formatParsedDate(date: ParsedDate): string {
@@ -336,8 +337,8 @@ export function nativeCalendarRecurrenceCandidate(master: CalendarEvent, verifie
   }).semantic;
   if (!semantic || semantic.count || semantic.until) return false;
   if (semantic.frequency === "DAILY") return semantic.interval <= 999;
-  if (semantic.interval !== 1) return false;
   if (semantic.frequency === "WEEKLY") return !semantic.byMonthDay && !semantic.byMonth
+    && (semantic.interval === 1 || !semantic.byDay || semantic.byDay.length === 1)
     && !semantic.byDay?.some((day) => day.length > 2);
   if (semantic.frequency === "MONTHLY") return !semantic.byMonth && (
     semantic.byDay?.length === 1 && /^(?:-1|[1-5])(?:MO|TU|WE|TH|FR)$/.test(semantic.byDay[0])
@@ -442,9 +443,10 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   const startPhrase = localDate(start, timeZone);
   // The UTC date of an offset timestamp can differ from its Calendar-local day.
   const recurrenceStartIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  const base = { rule, semantic, startDate: recurrenceStartIsoDate, ...(time ? { time } : {}) };
+  const base = { rule, semantic, startDate: recurrenceStartIsoDate,
+    ...(interval > 1 ? { interval } : {}), ...(time ? { time } : {}) };
   if (fields.FREQ === "DAILY") {
-    return { ...base, frequency: "daily", ...(interval > 1 ? { interval } : {}),
+    return { ...base, frequency: "daily",
       dueString: `every ${interval > 1 ? `${interval} days` : "day"}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "WEEKLY") {
@@ -453,25 +455,27 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
     if (fields.BYMONTH || fields.BYMONTHDAY || weekdays.some((value) => !value)
       || !weekdays.includes(weekday)) return undefined;
     const weekdayPhrase = weekdays.join(", ");
+    if (interval > 1 && weekdays.length !== 1) return undefined;
     return { ...base, frequency: "weekly", ...(weekdays.length === 1 ? { weekday } : {}),
-      dueString: `every ${weekdayPhrase}${timePhrase} starting ${startPhrase}` };
+      dueString: `every ${interval > 1 ? `${interval} weeks` : weekdayPhrase}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "MONTHLY") {
     if (position !== undefined) {
+      if (interval > 1) return undefined;
       return { ...base, frequency: "monthly", weekday, monthlyOrdinal: position,
         dueString: `every ${position === -1 ? "last" : ordinalLabels[position - 1]} ${weekday}${timePhrase} starting ${startPhrase}` };
     }
     if (fields.BYDAY || fields.BYSETPOS || fields.BYMONTH || day > 28
       || (fields.BYMONTHDAY && fields.BYMONTHDAY !== String(day))) return undefined;
     return { ...base, frequency: "monthly", dayOfMonth: day,
-      dueString: `every ${day}${day % 100 >= 11 && day % 100 <= 13 ? "th" : day % 10 === 1 ? "st" : day % 10 === 2 ? "nd" : day % 10 === 3 ? "rd" : "th"}${timePhrase} starting ${startPhrase}` };
+      dueString: `every ${interval > 1 ? `${interval} months` : `${day}${day % 100 >= 11 && day % 100 <= 13 ? "th" : day % 10 === 1 ? "st" : day % 10 === 2 ? "nd" : day % 10 === 3 ? "rd" : "th"}`}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "YEARLY") {
     if (fields.BYDAY || (month === 2 && day === 29)
       || (fields.BYMONTH && fields.BYMONTH !== String(month))
       || (fields.BYMONTHDAY && fields.BYMONTHDAY !== String(day))) return undefined;
     return { ...base, frequency: "yearly", dayOfMonth: day, month,
-      dueString: `every ${day} ${monthNames[month - 1]}${timePhrase} starting ${startPhrase}` };
+      dueString: `every ${interval > 1 ? `${interval} years` : `${day} ${monthNames[month - 1]}`}${timePhrase} starting ${startPhrase}` };
   }
   return undefined;
 }
@@ -485,10 +489,13 @@ function parseOpenTodoistRule(value: string | undefined, task: TodoistTask, veri
 } | undefined {
   if (!value) return undefined;
   const normalized = value.trim().replace(/\s+/g, " ");
-  const starting = normalized.match(/^(.*?)\s+starting(?:\s+on)?\s+(.+)$/i);
-  const expression = starting ? starting[1] : normalized;
-  const start = starting ? parseNaturalDate(starting[2]) : undefined;
-  if (starting && !start) return undefined;
+  const boundary = parseTodoistStartBoundary(normalized);
+  if (boundary.invalid) return undefined;
+  const expression = boundary.expression;
+  const start = boundary.startDate ? parseNaturalDate(boundary.startDate)
+    : boundary.startMonthDay ? parseNaturalDate(boundary.startMonthDay.slice(3) + " " + monthNames[Number(boundary.startMonthDay.slice(0, 2)) - 1])
+      : undefined;
+  if (boundary.hasBoundary && !start) return undefined;
   const dueAnchor = task.due?.datetime || task.due?.date;
   if (!dueAnchor) return undefined;
   const anchor = recurrenceCivilAnchor(dueAnchor, verifiedTimeZone);
@@ -527,7 +534,11 @@ function openRuleMatches(
   const parsed = parseOpenTodoistRule(task.due?.string, task, verifiedTimeZone);
   const expectedStart = recurrence.startDate ? parseNaturalDate(recurrence.startDate) : undefined;
   const anchor = parsed?.start;
-  const correctStart = !anchor || Boolean(expectedStart && anchor.day === expectedStart.day
+  // DTSTART is the immutable Calendar cadence anchor. A provider may retain
+  // a later, explicitly projected start after a historical series is first
+  // mirrored. Validate that start independently instead of demanding equality
+  // with the master date. Never accept a future or off-phase explicit start.
+  const originalStartMatches = Boolean(expectedStart && anchor && anchor.day === expectedStart.day
     && anchor.month === expectedStart.month && (!anchor.year || anchor.year === expectedStart.year));
   const due = occurrence?.originalStartTime?.dateTime || occurrence?.originalStartTime?.date
     || occurrence?.start?.dateTime || occurrence?.start?.date
@@ -553,6 +564,18 @@ function openRuleMatches(
   }
   const expectedCadenceDate = Boolean(currentDay && recurrence.semantic
     && recurrenceIncludesDate(recurrence.semantic, currentDay));
+  const projectedStartMatches = Boolean(anchor && recurrence.semantic && currentDay && (() => {
+    // A yearless provider normalization can refer to a prior eligible
+    // occurrence, so try the bounded range between original and active years.
+    const first = anchor.year || Number(recurrence.semantic!.startDate.slice(0, 4));
+    const last = anchor.year || Number(currentDay!.slice(0, 4));
+    for (let year = first; year <= last; year++) {
+      const candidate = formatParsedDate({ ...anchor, year });
+      if (candidate <= currentDay! && recurrenceIncludesDate(recurrence.semantic!, candidate)) return true;
+    }
+    return false;
+  })());
+  const correctStart = !anchor || originalStartMatches || projectedStartMatches;
   // Provider due time and zone are semantic readback, not just phrase text.
   const zoneMatches = !task.due?.timezone || task.due.timezone === verifiedTimeZone;
   const dueValue = task.due?.datetime || task.due?.date;
@@ -721,9 +744,39 @@ export function calendarOwnedTodoistRecurrence(
 
   const time = startParts.hour ? ` at ${startParts.hour}:${startParts.minute}${(startParts.dayPeriod || "").toLowerCase()}` : "";
   const startDate = localDate(startValue, timeZone);
-  const endDate = localDate(endStart, timeZone);
-  const dueString = `every ${weekday}${time} starting ${startDate} and ending ${endDate}`;
-  return { dueString, endDate, weekday, rule };
+  const endDate = localIsoDate(endStart, timeZone);
+  const dueString = `every ${weekday}${time} starting ${startDate} and ending ${localDate(endStart, timeZone)}`;
+  return { dueString, endDate, weekday, rule, semantic, startDate: semantic.startDate };
+}
+
+/**
+ * Todoist's starting clause takes precedence over the structured due date.
+ * Re-anchor an open native projection only at an independently verified,
+ * unmodified occurrence of the original RRULE. Keep the master semantic
+ * anchor untouched for reverse sync, completion and readback.
+ */
+function projectionDueString(
+  event: CalendarEvent,
+  recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
+): string {
+  const semantic = recurrence.semantic;
+  const original = event.originalStartTime?.dateTime || event.originalStartTime?.date;
+  const effective = event.start?.dateTime || event.start?.date;
+  const zone = verifiedTimeZone || semantic?.timeZone;
+  if (!semantic || (semantic.count !== undefined && !recurrence.endDate)
+    || semantic.until !== undefined || !original || !effective
+    || (original.includes("T") && !zone)) return recurrence.dueString;
+  const anchor = recurrenceCivilAnchor(original, zone);
+  const active = recurrenceCivilAnchor(effective, zone);
+  if (!anchor || !active || anchor.date !== active.date || anchor.time !== active.time
+    || anchor.time !== semantic.localTime || anchor.date <= semantic.startDate
+    || recurrence.endDate && anchor.date > recurrence.endDate
+    || !recurrenceIncludesDate(semantic, anchor.date)) return recurrence.dueString;
+  // Keep an existing inclusive end boundary when projecting a supported
+  // finite COUNT schedule from its next outstanding Calendar occurrence.
+  return recurrence.dueString.replace(/(\s+starting(?:\s+on)?\s+)(.+?)(?=\s+and\s+ending\b|$)/i,
+    (_all, prefix: string) => prefix + localDate(original, zone || "UTC"));
 }
 
 export function calendarOwnedRecurringTaskPayload(
@@ -738,7 +791,7 @@ export function calendarOwnedRecurringTaskPayload(
     due: {
       ...(start.dateTime ? { datetime: start.dateTime, ...(verifiedTimeZone || start.timeZone ? { timezone: verifiedTimeZone || start.timeZone } : {}) } : {}),
       ...(start.date ? { date: start.date } : {}),
-      string: recurrence.dueString,
+      string: projectionDueString(event, recurrence, verifiedTimeZone),
       lang: "en",
       is_recurring: true,
     },

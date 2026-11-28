@@ -5,8 +5,10 @@ import { CalendarCorrelationConflictError, ReconciliationItemError } from "../di
 import { profiles } from "../dist/config.js";
 import { mappingFromProjectMappingComment, parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
 import { nativeRecurrenceShape, Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
-import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
+import { calendarRuleMatches, selectNextEffectiveTodoistInstance, todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
+import { SnapshotReconciler } from "../dist/reconciliation.js";
+import { calendarOwnedRecurringTaskPayload, calendarOwnedTodoistRecurrence, verifiedCalendarOwnedRecurrence } from "../dist/calendar-owned-todoist-recurrence.js";
 
 const PROFILE = "home";
 const MASTER = "calendar-master";
@@ -1348,26 +1350,43 @@ test("completion skips a deleted future Calendar occurrence", async () => {
   assert.equal(state.links[0].activeEffectiveStart, "2026-09-08");
 });
 
-test("Todoist canonical echo preserves Calendar recurrence ownership before completion skips a canceled occurrence", async () => {
+test("finite weekly lifecycle preserves canceled and moved exceptions through completion and reschedule", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2099-09-06T08:00:00Z") });
   const dates = ["2099-09-06", "2099-09-13", "2099-09-20", "2099-09-27"];
   const master = {
-    id: MASTER, iCalUID: SERIES, summary: "Water plants", status: "confirmed",
-    start: { date: dates[0] }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+    id: MASTER, iCalUID: SERIES, etag: '"finite-master-v1"', summary: "Water plants", status: "confirmed",
+    start: { date: dates[0] }, end: { date: addDay(dates[0]) }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+    extendedProperties: { shared: { taskId: "task-calendar-owned", syncSeriesId: SERIES } },
   };
   const current = instance("instance-1", dates[0], addDay(dates[0]));
+  current.etag = '"finite-current-v1"';
   const cancelled = instance("instance-2", dates[1], addDay(dates[1]), "cancelled");
-  const next = instance("instance-3", dates[2], addDay(dates[2]));
+  const next = instance("instance-3", dates[2], dates[2]);
+  next.start = { date: "2099-09-25" };
+  next.end = { date: "2099-09-26" };
+  next.etag = '"finite-moved-v1"';
   const final = instance("instance-4", dates[3], addDay(dates[3]));
   for (const occurrence of [current, cancelled, next, final]) occurrence.summary = "Water plants";
   const recurrenceText = "every Sunday ending 27 Sep 2099";
   const initialTask = {
-    id: "task-calendar-owned", content: "Water plants", description: "", project_id: "home-project",
+    id: "task-calendar-owned", content: "Water plants", description: "", project_id: profiles[PROFILE].todoistProjectId,
     due: { date: dates[0], is_recurring: true, string: recurrenceText },
   };
   const link = linkFor(current, initialTask.id);
   const state = new FakeState(link);
   const tasks = new Map([[initialTask.id, structuredClone(initialTask)]]);
   const clients = fakeClients(state, [current, cancelled, next, final], tasks, undefined, [master]);
+  clients.calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+    const existing = clients.events.get(eventId);
+    assert.equal(existing.etag, etag);
+    const updated = { ...structuredClone(existing), ...structuredClone(payload), id: eventId,
+      etag: '"finite-moved-rescheduled-v1"' };
+    clients.events.set(eventId, updated);
+    const inInventory = [current, cancelled, next, final].find((event) => event.id === eventId);
+    if (inInventory) Object.assign(inInventory, structuredClone(updated));
+    clients.calendarUpserts.push({ id: eventId, payload: structuredClone(payload) });
+    return structuredClone(updated);
+  };
   const sync = new Synchronizer(state, undefined, async () => clients);
 
   await sync.process({
@@ -1399,14 +1418,68 @@ test("Todoist canonical echo preserves Calendar recurrence ownership before comp
   });
 
   assert.equal(clients.todoistRecurringUpdates.length, 1);
-  assert.equal(clients.todoistRecurringUpdates[0].stored.due.date, dates[2]);
+  assert.equal(clients.todoistRecurringUpdates[0].stored.due.date, "2099-09-25");
   assert.equal(state.links[0].owner, "calendar");
   assert.equal(state.links[0].activeInstanceId, next.id);
+  assert.equal(state.links[0].originalStart, dates[2]);
+  assert.equal(state.links[0].activeEffectiveStart, "2099-09-25");
   assert.equal(state.links[0].masterEventId, MASTER);
   assert.equal(clients.calendarUpserts.length, 0, "completion must advance the existing Calendar series without creating a standalone event");
   assert.deepEqual(clients.calendarDeletes, []);
   assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;COUNT=4"]);
   assert.equal(clients.events.has(final.id), true);
+  assert.equal(clients.events.get(cancelled.id).status, "cancelled");
+  assert.equal(clients.events.get(next.id).originalStartTime.date, dates[2]);
+  assert.equal(clients.events.get(next.id).start.date, "2099-09-25");
+
+  const advanced = clients.todoistRecurringUpdates[0].stored;
+  const rescheduled = { ...advanced, due: { ...advanced.due, date: "2099-09-26" } };
+  tasks.set(advanced.id, rescheduled);
+  await sync.process({
+    id: "todoist-finite-moved-reschedule", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-25T09:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: rescheduled,
+      event_data_extra: { update_intent: "item_updated", old_item: advanced } }),
+  });
+  const movedAfterReschedule = clients.events.get(next.id);
+  assert.equal(movedAfterReschedule.originalStartTime.date, dates[2]);
+  assert.equal(movedAfterReschedule.start.date, "2099-09-26");
+  assert.equal(clients.events.get(cancelled.id).status, "cancelled");
+  assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;COUNT=4"]);
+  assert.equal(state.links[0].activeInstanceId, next.id);
+  assert.equal(state.links[0].originalStart, dates[2]);
+  assert.equal(state.links[0].activeEffectiveStart, "2099-09-26");
+
+  const writesBeforeSnapshot = clients.calendarUpserts.length + clients.todoistUpserts.length
+    + clients.todoistRecurringUpdates.length;
+  const snapshot = new SnapshotReconciler(state, async () => clients, undefined, undefined, async () => ({
+    total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
+  }));
+  const snapshotResult = await snapshot.reconcile(PROFILE);
+  assert.equal(snapshotResult.counts.noop, 1);
+  assert.equal(clients.calendarUpserts.length + clients.todoistUpserts.length
+    + clients.todoistRecurringUpdates.length, writesBeforeSnapshot,
+  "snapshot after moved finite completion and reschedule makes no provider writes");
+
+  const todoistWritesBeforeDeletion = clients.todoistUpserts.length;
+  tasks.delete(rescheduled.id);
+  await sync.process({
+    id: "todoist-finite-series-delete", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-26T10:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:deleted", event_data: { ...rescheduled, is_deleted: true },
+      event_data_extra: { old_item: rescheduled } }),
+  });
+  assert.ok(clients.calendarDeletes.includes(MASTER));
+  assert.equal(clients.events.has(MASTER), false);
+  assert.equal(clients.projectComments.filter((comment) => comment.is_deleted !== true).length, 0);
+  await sync.process({
+    id: "todoist-finite-stale-completion-after-delete", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-26T10:01:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:completed", event_data: rescheduled,
+      event_data_extra: { old_item: rescheduled } }),
+  });
+  assert.equal(clients.todoistUpserts.length, todoistWritesBeforeDeletion);
+  assert.equal(clients.events.has(MASTER), false, "stale finite completion cannot resurrect the deleted series");
 });
 
 test("moved Calendar exception can cross another occurrence without changing logical identity", () => {
@@ -1688,7 +1761,7 @@ test("Calendar-owned native task creation echo never PUTs the generated Calendar
   assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_echo_ignored");
 });
 
-test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calendar master", async () => {
+test("genuine Todoist title and description edits PATCH only the Calendar master", async () => {
   const current = instance("oct-28", "2026-10-28", "2026-10-29");
   current.summary = "Weekly test";
   const master = { id: MASTER, etag: '"v1"', iCalUID: SERIES, status: "confirmed",
@@ -1698,7 +1771,7 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
     syncedTitle: "Weekly test", syncedDescription: "" };
   const state = new FakeState(link);
   const task = { id: link.taskId, project_id: "home-project",
-    content: "Renamed from Todoist", description: "",
+    content: "Renamed from Todoist", description: "Updated from Todoist",
     due: { date: "2026-11-04", string: "every Wednesday", is_recurring: true } };
   const tasks = new Map([[task.id, structuredClone(task)]]);
   const clients = fakeClients(state, [current], tasks, undefined, [master]);
@@ -1706,14 +1779,697 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
     id: "edit", kind: "todoist", profile: PROFILE, mode: "aws",
     receivedAt: "2026-10-26T15:10:27Z", headers: {},
     body: JSON.stringify({ event_name: "item:updated", event_data: task,
-      event_data_extra: { old_item: { ...task, content: "Weekly test" } } }),
+      event_data_extra: { old_item: { ...task, content: "Weekly test", description: "" } } }),
   });
   assert.equal(clients.calendarUpserts.length, 1);
   assert.equal(clients.calendarUpserts[0].metadataOnly, true);
   assert.equal(clients.events.get(MASTER).summary, "Renamed from Todoist");
+  assert.equal(clients.events.get(MASTER).description, "Updated from Todoist");
   assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;BYDAY=WE"]);
   assert.equal(tasks.get(task.id).due.date, "2026-11-04");
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
+  assert.equal(state.mappingsByTask.get(task.id).syncedDescription, "Updated from Todoist");
+});
+
+test("an explicit annual Todoist cadence edit creates a Calendar-owned future successor and preserves history", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-28T12:00:00Z") });
+  const current = instance("annual-2027", "2027-01-01", "2027-01-02");
+  current.summary = "Annual review";
+  const master = { id: MASTER, etag: '"annual-master-v4"', iCalUID: SERIES, status: "confirmed",
+    summary: "Annual review", description: "", start: { date: "2026-01-01" }, end: { date: "2026-01-02" },
+    colorId: "5", location: "Studio 2", visibility: "private", transparency: "transparent",
+    reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 30 }] },
+    recurrence: ["RRULE:FREQ=YEARLY"],
+    extendedProperties: { shared: { taskId: "annual-task", syncSeriesId: SERIES,
+      syncProgressVersion: "1", externalLabel: "blue" }, private: { clientRef: "review-42" } } };
+  const link = { ...linkFor(current, "annual-task"), syncedTitle: "Annual review", syncedDescription: "" };
+  const state = new FakeState(link);
+  const oldTask = { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId,
+    content: "Annual review", description: "", labels: ["annual", "work"], priority: 3,
+    updated_at: "2026-11-28T10:00:00Z",
+    due: { date: "2027-01-01", string: "every year", is_recurring: true } };
+  link.syncBaseline = providerSyncBaseline(oldTask, current, master);
+  state.storeMapping(mappingFromLink(link));
+  state.links[0].syncBaseline = structuredClone(link.syncBaseline);
+  let task = { ...structuredClone(oldTask), due: { ...oldTask.due, string: "every 2 years" } };
+  const tasks = new Map([[task.id, structuredClone(task)]]);
+  const fixtureInstances = [current];
+  const clients = fakeClients(state, fixtureInstances, tasks, undefined, [master]);
+  const calendar = clients.calendar;
+  const providerUpsertTask = clients.todoist.upsertTask.bind(clients.todoist);
+  clients.todoist.upsertTask = async (payload, existingId, requestKey) => {
+    const existing = existingId ? tasks.get(existingId) : undefined;
+    return providerUpsertTask({ ...payload,
+      ...(existing?.labels && payload.labels === undefined ? { labels: existing.labels } : {}),
+      ...(existing?.priority !== undefined && payload.priority === undefined ? { priority: existing.priority } : {}),
+    }, existingId, requestKey);
+  };
+  calendar.listExplicitSeriesExceptions = async (masterId) => {
+    const masterEvent = clients.events.get(masterId);
+    if (!masterEvent) return [];
+    return fixtureInstances.filter((event) => event.recurringEventId === masterId && (
+      event.status === "cancelled"
+      || (event.originalStartTime?.date || event.originalStartTime?.dateTime)
+        !== (event.start?.date || event.start?.dateTime)
+      || event.summary !== masterEvent.summary
+      || (event.description || "") !== (masterEvent.description || "")
+    )).map((event) => structuredClone(event));
+  };
+  calendar.listInstancesInWindow = async (masterId, start, end) => {
+    const masterEvent = clients.events.get(masterId);
+    const until = masterEvent?.recurrence?.[0]?.match(/(?:^|;)UNTIL=(\d{8})/)?.[1];
+    const cap = until && until.slice(0, 4) + "-" + until.slice(4, 6) + "-" + until.slice(6, 8);
+    const fromDate = start.slice(0, 10), toDate = end.slice(0, 10);
+    return fixtureInstances.filter((event) => event.recurringEventId === masterId
+      && (event.originalStartTime?.date || event.start?.date) >= fromDate
+      && (event.originalStartTime?.date || event.start?.date) <= toDate
+      && (!cap || (event.originalStartTime?.date || event.start?.date) <= cap)
+      && (event.originalStartTime?.date || event.start?.date) <= "2036-01-01")
+      .map((event) => structuredClone(event));
+  };
+  calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+    const existing = clients.events.get(eventId);
+    assert.equal(existing.etag, etag);
+    const updated = { ...structuredClone(payload), id: eventId, etag: '"annual-master-capped"' };
+    clients.events.set(eventId, updated);
+    const instanceIndex = fixtureInstances.findIndex((event) => event.id === eventId);
+    if (instanceIndex >= 0) fixtureInstances[instanceIndex] = structuredClone(updated);
+    for (let index = fixtureInstances.length - 1; index >= 0; index -= 1)
+      if (fixtureInstances[index].recurringEventId === eventId
+        && (fixtureInstances[index].originalStartTime?.date || fixtureInstances[index].start.date) > "2026-01-01")
+        fixtureInstances.splice(index, 1);
+    for (const [id, event] of clients.events) {
+      if (event.recurringEventId === eventId
+        && (event.originalStartTime?.date || event.start?.date) > "2026-01-01") clients.events.delete(id);
+    }
+    clients.calendarUpserts.push({ id: eventId, recurrence: structuredClone(updated.recurrence) });
+    return structuredClone(updated);
+  };
+  let failSuccessorCreationOnce = true;
+  calendar.createFutureMasterOnce = async (event) => {
+    if (clients.events.has(event.id)) return clients.events.get(event.id);
+    if (failSuccessorCreationOnce) {
+      failSuccessorCreationOnce = false;
+      throw new Error("simulated transient successor creation failure");
+    }
+    const created = { ...structuredClone(event), status: "confirmed", etag: '"future-master-v1"' };
+    clients.events.set(event.id, created);
+    const date = event.start.date;
+    const futureInstance = { id: "future-annual-2027", status: "confirmed", recurringEventId: event.id,
+      originalStartTime: { date }, start: { date }, end: { date: "2027-01-02" },
+      summary: event.summary, description: event.description, etag: '"future-instance-v1"' };
+    fixtureInstances.push(futureInstance);
+    clients.events.set(futureInstance.id, structuredClone(futureInstance));
+    return structuredClone(created);
+  };
+  fixtureInstances.splice(0, fixtureInstances.length,
+    { ...instance("annual-2026", "2026-01-01", "2026-01-02"), summary: "Annual review",
+      start: { date: "2026-01-03" }, end: { date: "2026-01-04" } },
+    current,
+  );
+  clients.events.set(MASTER, structuredClone(master));
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  const delivery = {
+    id: "annual-cadence-edit", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2026-11-28T10:01:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: task,
+      event_data_extra: { update_intent: "item_updated", old_item: oldTask } }),
+  };
+  const originalMasterRead = calendar.getEvent.bind(calendar);
+  let masterReads = 0;
+  calendar.getEvent = async (id) => {
+    const event = await originalMasterRead(id);
+    if (id !== MASTER) return event;
+    masterReads += 1;
+    return masterReads === 2 ? { ...event, etag: '"concurrently-updated-master"' } : event;
+  };
+  const writesBeforeStaleProviderRead = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "annual-cadence-edit-stale-provider" });
+  assert.ok(masterReads >= 2, "worker rereads the Calendar master before applying a cadence edit");
+  assert.equal(clients.calendarUpserts.length, writesBeforeStaleProviderRead);
+  assert.equal(state.audits.at(-1).detail.reason, "fresh_provider_identity_or_exception_check_failed");
+  calendar.getEvent = originalMasterRead;
+  await assert.rejects(() => sync.process(delivery), /needs retry/);
+  assert.equal(clients.events.get(MASTER).extendedProperties.shared.syncHistoryOnly, "true",
+    "the first attempt safely caps history before a transient successor failure");
+  await sync.process(delivery);
+  const oldAfter = clients.events.get(MASTER);
+  assert.equal(oldAfter.start.date, "2026-01-01");
+  assert.equal(oldAfter.extendedProperties.shared.syncHistoryOnly, "true");
+  assert.equal(oldAfter.extendedProperties.shared.syncHistoryCutoff, "2026-01-01");
+  assert.deepEqual(oldAfter.recurrence, ["RRULE:FREQ=YEARLY;UNTIL=20260101"]);
+  assert.ok(fixtureInstances.some((event) => event.id === "annual-2026" && event.start.date === "2026-01-03"),
+    "historical moved exception remains unchanged");
+  const newMaster = [...clients.events.values()].find((event) => event.id !== MASTER
+    && event.extendedProperties?.shared?.taskId === task.id);
+  assert.ok(newMaster, JSON.stringify(state.audits.slice(-3)));
+  assert.deepEqual(newMaster.recurrence, ["RRULE:FREQ=YEARLY;INTERVAL=2"]);
+  assert.equal(newMaster.colorId, "5");
+  assert.equal(newMaster.location, "Studio 2");
+  assert.equal(newMaster.visibility, "private");
+  assert.equal(newMaster.transparency, "transparent");
+  assert.deepEqual(newMaster.reminders, { useDefault: false, overrides: [{ method: "popup", minutes: 30 }] });
+  assert.equal(newMaster.extendedProperties.shared.externalLabel, "blue");
+  assert.equal(newMaster.extendedProperties.private.clientRef, "review-42");
+  const mapping = state.mappingsByTask.get(task.id);
+  assert.equal(mapping.masterEventId, newMaster.id);
+  assert.equal(mapping.seriesId, newMaster.id);
+  assert.notEqual(mapping.seriesId, task.id, "Calendar ownership remains with the successor series");
+  assert.equal(mapping.activeInstanceId, "future-annual-2027");
+  assert.equal(mapping.originalStart, "2027-01-01");
+  assert.equal(mapping.activeEffectiveStart, "2027-01-01");
+  assert.deepEqual(state.links.map((item) => item.seriesId), [newMaster.id]);
+  assert.equal(providerSyncBaseline(task, fixtureInstances.at(-1), newMaster).calendar.recurrence,
+    mapping.syncBaseline.calendar.recurrence);
+  assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_future_recurrence_edit_applied");
+  const writesAfterApply = clients.calendarUpserts.length;
+  await sync.process(delivery);
+  assert.equal(clients.calendarUpserts.length, writesAfterApply, "replay must not cap history or create another successor");
+  assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === task.id).length, 1);
+  assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_echo_ignored");
+  const writesBeforeSnapshot = clients.calendarUpserts.length + clients.todoistUpserts.length;
+  const snapshot = new SnapshotReconciler(state, async () => clients, undefined, undefined, async () => ({
+    total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
+  }));
+  const snapshotResult = await snapshot.reconcile(PROFILE);
+  assert.equal(snapshotResult.counts.noop, 1, "snapshot preserves the exact correlated recurrence pair");
+  assert.equal(clients.calendarUpserts.length + clients.todoistUpserts.length, writesBeforeSnapshot,
+    "snapshot after the future split makes no unnecessary provider writes");
+
+  const metadataTask = { ...task, content: "Annual review updated", description: "Annual details",
+    updated_at: "2026-11-28T10:02:00Z" };
+  tasks.set(task.id, metadataTask);
+  const recurrenceBeforeMetadata = [...clients.events.get(newMaster.id).recurrence];
+  const writesBeforeMetadata = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "annual-metadata-edit", body: JSON.stringify({
+    event_name: "item:updated", event_data: metadataTask, event_data_extra: { old_item: task },
+  }) });
+  assert.equal(clients.calendarUpserts.length, writesBeforeMetadata + 1);
+  assert.equal(clients.calendarUpserts.at(-1).metadataOnly, true);
+  assert.deepEqual(clients.events.get(newMaster.id).recurrence, recurrenceBeforeMetadata);
+  assert.equal(clients.events.get(newMaster.id).summary, metadataTask.content);
+  assert.equal(clients.events.get(newMaster.id).description, metadataTask.description);
+  assert.equal(state.mappingsByTask.get(task.id).syncedTitle, metadataTask.content);
+  assert.equal(state.mappingsByTask.get(task.id).syncedDescription, metadataTask.description);
+  assert.deepEqual(state.mappingsByTask.get(task.id).syncBaseline,
+    providerSyncBaseline(metadataTask, fixtureInstances.find((event) => event.id === "future-annual-2027"),
+      clients.events.get(newMaster.id)), "metadata baseline is committed only after Calendar readback");
+  assert.deepEqual(tasks.get(task.id).labels, ["annual", "work"]);
+  assert.equal(tasks.get(task.id).priority, 3);
+  const writesAfterMetadata = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "annual-metadata-edit-replay", body: JSON.stringify({
+    event_name: "item:updated", event_data: metadataTask, event_data_extra: { old_item: task },
+  }) });
+  assert.equal(clients.calendarUpserts.length, writesAfterMetadata,
+    "a replayed metadata edit does not issue another Calendar patch");
+  task = metadataTask;
+
+  const calendarEditBack = { ...clients.events.get(newMaster.id), recurrence: ["RRULE:FREQ=YEARLY"], etag: '"future-master-v2"' };
+  clients.events.set(newMaster.id, calendarEditBack);
+  clients.calendar.listDelta = async () => ({ items: [structuredClone(calendarEditBack)], nextSyncToken: "sync-next" });
+  await sync.process({ ...delivery, id: "calendar-edit-back", kind: "calendar", body: "",
+    receivedAt: "2026-11-28T10:03:00Z" });
+  assert.equal(tasks.get(task.id).due.string, "every 1 Jan starting 1 Jan 2027");
+  assert.deepEqual(tasks.get(task.id).labels, ["annual", "work"]);
+  assert.equal(tasks.get(task.id).priority, 3);
+  assert.equal(state.mappingsByTask.get(task.id).masterEventId, newMaster.id);
+  assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === task.id).length, 1);
+  const todoistWritesAfterCalendarEdit = clients.todoistUpserts.length;
+  await sync.process({ ...delivery, id: "calendar-edit-back-replay", kind: "calendar", body: "",
+    receivedAt: "2026-11-28T10:04:00Z" });
+  assert.equal(clients.todoistUpserts.length, todoistWritesAfterCalendarEdit);
+
+  const competingMaster = { ...calendarEditBack, recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=2"], etag: '"future-master-v3"' };
+  clients.events.set(newMaster.id, competingMaster);
+  const competingTask = { ...task, due: { ...task.due, string: "every 3 years" } };
+  tasks.set(task.id, competingTask);
+  const calendarWritesBeforeConflict = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "competing-cadence-edit", receivedAt: "2026-11-28T10:05:00Z",
+    body: JSON.stringify({ event_name: "item:updated", event_data: competingTask,
+      event_data_extra: { update_intent: "item_updated", old_item: task } }) });
+  assert.equal(clients.calendarUpserts.length, calendarWritesBeforeConflict);
+  assert.deepEqual(clients.events.get(newMaster.id).recurrence, ["RRULE:FREQ=YEARLY;INTERVAL=2"]);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_owned_todoist_recurrence_requires_review"));
+  const rescheduledTask = { ...task, due: { ...task.due, date: "2027-01-02" } };
+  tasks.set(task.id, rescheduledTask);
+  const masterRuleBeforeReschedule = [...clients.events.get(newMaster.id).recurrence];
+  await sync.process({ ...delivery, id: "reschedule-successor-occurrence", receivedAt: "2026-11-28T10:06:00Z",
+    body: JSON.stringify({ event_name: "item:updated", event_data: rescheduledTask,
+      event_data_extra: { update_intent: "item_updated", old_item: task } }) });
+  const activeAfterReschedule = clients.events.get("future-annual-2027");
+  assert.equal(activeAfterReschedule.originalStartTime.date, "2027-01-01");
+  assert.equal(activeAfterReschedule.start.date, "2027-01-02");
+  assert.deepEqual(clients.events.get(newMaster.id).recurrence, masterRuleBeforeReschedule,
+    "a current-occurrence reschedule changes only its exception, not the RRULE master");
+  assert.ok(fixtureInstances.some((event) => event.id === "annual-2026" && event.start.date === "2026-01-03"),
+    "rescheduling the successor leaves the historical moved exception unchanged");
+
+  const nextOccurrence = { id: "future-annual-2029", status: "confirmed", recurringEventId: newMaster.id,
+    originalStartTime: { date: "2029-01-01" }, start: { date: "2029-01-01" }, end: { date: "2029-01-02" },
+    summary: task.content, description: task.description, etag: '"future-instance-2029-v1"' };
+  fixtureInstances.push(nextOccurrence);
+  clients.events.set(nextOccurrence.id, structuredClone(nextOccurrence));
+  const advancedTask = { ...rescheduledTask, due: { ...rescheduledTask.due, date: "2029-01-01" } };
+  tasks.set(task.id, advancedTask);
+  t.mock.timers.setTime(Date.parse("2027-01-03T12:00:00Z"));
+  const calendarWritesBeforeCompletion = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "complete-successor-occurrence", receivedAt: "2027-01-03T12:00:00Z",
+    body: JSON.stringify({ event_name: "item:completed", event_data: rescheduledTask,
+      event_data_extra: { old_item: rescheduledTask } }) });
+  assert.equal(state.mappingsByTask.get(task.id).activeInstanceId, nextOccurrence.id);
+  assert.equal(state.mappingsByTask.get(task.id).originalStart, "2029-01-01");
+  assert.equal(clients.calendarUpserts.length, calendarWritesBeforeCompletion,
+    "completing the active task advances mapping without rewriting the historical master");
+  assert.ok(fixtureInstances.some((event) => event.id === "annual-2026" && event.start.date === "2026-01-03"),
+    "completion leaves the original moved historical exception unchanged");
+
+  const todoistWritesBeforeDeletion = clients.todoistUpserts.length;
+  tasks.delete(task.id);
+  await sync.process({ ...delivery, id: "delete-successor-series", receivedAt: "2027-01-03T12:01:00Z",
+    body: JSON.stringify({ event_name: "item:deleted", event_data: { ...advancedTask, is_deleted: true },
+      event_data_extra: { old_item: advancedTask } }) });
+  assert.ok(clients.calendarDeletes.includes(newMaster.id), "whole-series deletion removes the mapped successor master");
+  assert.ok(!clients.calendarDeletes.includes(MASTER), "deletion leaves the historical master untouched");
+  assert.equal(clients.projectComments.filter((comment) => comment.is_deleted !== true).length, 0,
+    "deletion removes the provider-native task mapping");
+  assert.equal(clients.events.has(newMaster.id), false);
+  assert.equal(clients.events.get(MASTER).extendedProperties.shared.syncHistoryOnly, "true");
+  await sync.process({ ...delivery, id: "stale-completion-after-series-delete", receivedAt: "2027-01-03T12:02:00Z",
+    body: JSON.stringify({ event_name: "item:completed", event_data: rescheduledTask,
+      event_data_extra: { old_item: rescheduledTask } }) });
+  assert.equal(clients.todoistUpserts.length, todoistWritesBeforeDeletion,
+    "a stale completion cannot recreate the deleted task or recurrence");
+
+});
+
+test("explicit all-day daily, weekly, monthly and yearly cadence edits preserve their provider history", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-27T12:00:00Z") });
+  const cases = [
+    { name: "daily interval", rule: "RRULE:FREQ=DAILY;INTERVAL=2", anchor: "2024-01-01",
+      previous: "2026-11-26", active: "2026-11-28", nextDue: "2026-11-28", editedRule: "RRULE:FREQ=WEEKLY", editedPhrase: "every week" },
+    { name: "weekly cadence", rule: "RRULE:FREQ=WEEKLY;BYDAY=WE", anchor: "2024-01-03",
+      previous: "2026-11-25", active: "2026-12-02", nextDue: "2026-12-02", editedRule: "RRULE:FREQ=MONTHLY;INTERVAL=2", editedPhrase: "every 2 months" },
+    { name: "monthly selector", rule: "RRULE:FREQ=MONTHLY;BYDAY=2TU", anchor: "2024-01-09",
+      previous: "2026-11-10", active: "2026-12-08", nextDue: "2026-12-08", editedRule: "RRULE:FREQ=YEARLY;INTERVAL=2", editedPhrase: "every 2 years" },
+    { name: "yearly interval selector", rule: "RRULE:FREQ=YEARLY;INTERVAL=2;BYMONTH=1;BYMONTHDAY=15", anchor: "2023-01-15",
+      previous: "2025-01-15", active: "2027-01-15", nextDue: "2027-01-15", editedRule: "RRULE:FREQ=YEARLY;INTERVAL=3", editedPhrase: "every 3 years" },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const taskId = `cadence-matrix-task-${index}`;
+    const makeInstance = (id, date) => ({ id, status: "confirmed", recurringEventId: MASTER, iCalUID: SERIES,
+      originalStartTime: { date }, start: { date }, end: { date: addDay(date) },
+      summary: `Cadence ${item.name}`, description: "Preserve history" });
+    const master = { id: MASTER, etag: `"cadence-matrix-${index}-v1"`, iCalUID: SERIES, status: "confirmed",
+      summary: `Cadence ${item.name}`, description: "Preserve history",
+      start: { date: item.anchor }, end: { date: addDay(item.anchor) }, recurrence: [item.rule],
+      extendedProperties: { shared: { taskId, syncSeriesId: SERIES, syncProgressVersion: "1" } } };
+    const historical = makeInstance(`cadence-history-${index}`, item.previous);
+    const active = makeInstance(`cadence-active-${index}`, item.active);
+    const instances = [historical, active];
+    const recurrence = calendarOwnedTodoistRecurrence(master, instances, "Europe/London");
+    assert.ok(recurrence, `${item.name} original recurrence projects to Todoist`);
+    const link = { ...linkFor(active, taskId), syncedTitle: master.summary, syncedDescription: master.description };
+    const state = new FakeState(link);
+    const oldTask = { id: taskId, project_id: profiles[PROFILE].todoistProjectId,
+      ...calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London"),
+      updated_at: "2026-11-27T10:00:00Z" };
+    link.syncBaseline = providerSyncBaseline(oldTask, active, master);
+    state.storeMapping(mappingFromLink(link));
+    state.links[0].syncBaseline = structuredClone(link.syncBaseline);
+    const editedTask = { ...structuredClone(oldTask), due: { ...oldTask.due, string: item.editedPhrase },
+      updated_at: "2026-11-27T10:01:00Z" };
+    const tasks = new Map([[taskId, editedTask]]);
+    const clients = fakeClients(state, instances, tasks, undefined, [master]);
+    clients.events.set(MASTER, structuredClone(master));
+    clients.calendar.listInstancesInWindow = async (masterId, from, to) => {
+      const event = clients.events.get(masterId);
+      if (!event) return [];
+      const until = event.recurrence?.[0]?.match(/(?:^|;)UNTIL=(\d{8})/)?.[1];
+      const cap = until && `${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6, 8)}`;
+      return instances.filter((candidate) => candidate.recurringEventId === masterId
+        && (candidate.originalStartTime.date >= from.slice(0, 10))
+        && (candidate.originalStartTime.date <= to.slice(0, 10))
+        && (!cap || candidate.originalStartTime.date <= cap)).map((candidate) => structuredClone(candidate));
+    };
+    clients.calendar.listExplicitSeriesExceptions = async () => [];
+    clients.calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+      const existing = clients.events.get(eventId);
+      assert.equal(existing.etag, etag, `${item.name} uses the fresh master ETag`);
+      const updated = { ...structuredClone(payload), id: eventId, etag: `"cadence-matrix-${index}-capped"` };
+      clients.events.set(eventId, updated);
+      for (let cursor = instances.length - 1; cursor >= 0; cursor -= 1) {
+        const candidate = instances[cursor];
+        if (candidate.recurringEventId === eventId && candidate.originalStartTime.date > item.previous) {
+          clients.events.delete(candidate.id);
+          instances.splice(cursor, 1);
+        }
+      }
+      clients.calendarUpserts.push({ id: eventId, recurrence: structuredClone(updated.recurrence) });
+      return structuredClone(updated);
+    };
+    clients.calendar.createFutureMasterOnce = async (event) => {
+      const created = { ...structuredClone(event), status: "confirmed", etag: `"cadence-matrix-${index}-successor"` };
+      clients.events.set(created.id, created);
+      const future = makeInstance(`cadence-successor-${index}`, item.nextDue);
+      future.recurringEventId = created.id;
+      future.iCalUID = created.iCalUID;
+      future.summary = created.summary;
+      future.description = created.description;
+      instances.push(future);
+      clients.events.set(future.id, structuredClone(future));
+      return structuredClone(created);
+    };
+    const sync = new Synchronizer(state, undefined, async () => clients);
+    const delivery = { id: `cadence-matrix-edit-${index}`, kind: "todoist", profile: PROFILE, mode: "aws",
+      receivedAt: "2026-11-27T10:02:00Z", headers: {},
+      body: JSON.stringify({ event_name: "item:updated", event_data: editedTask,
+        event_data_extra: { update_intent: "item_updated", old_item: oldTask } }) };
+    await sync.process(delivery);
+
+    const archived = clients.events.get(MASTER);
+    assert.equal(archived.extendedProperties.shared.syncHistoryOnly, "true", `${item.name} archives old owner safely ${JSON.stringify(state.audits.slice(-3))}`);
+    assert.equal(archived.start.date, item.anchor, `${item.name} keeps historical DTSTART`);
+    assert.deepEqual(archived.recurrence, [`${item.rule};UNTIL=${item.previous.replace(/-/g, "")}`]);
+    assert.ok(instances.some((event) => event.id === historical.id), `${item.name} retains history instance`);
+    assert.equal(instances.some((event) => event.id === active.id), false, `${item.name} caps old future instance`);
+    const successor = [...clients.events.values()].find((event) => event.id !== MASTER
+      && event.extendedProperties?.shared?.taskId === taskId);
+    assert.ok(successor, `${item.name} creates exact successor`);
+    assert.deepEqual(successor.recurrence, [item.editedRule]);
+    assert.equal(successor.start.date, item.nextDue);
+    const mapping = state.mappingsByTask.get(taskId);
+    assert.equal(mapping.masterEventId, successor.id);
+    assert.equal(mapping.activeInstanceId, `cadence-successor-${index}`);
+    assert.equal(mapping.syncBaseline.calendar.recurrence, providerSyncBaseline(editedTask,
+      instances.find((event) => event.id === `cadence-successor-${index}`), successor).calendar.recurrence);
+    const writes = clients.calendarUpserts.length;
+    await sync.process(delivery);
+    assert.equal(clients.calendarUpserts.length, writes, `${item.name} replay does not create another successor`);
+    assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === taskId).length, 1);
+
+    const reverseMaster = { ...successor, recurrence: [item.rule], etag: `"cadence-matrix-${index}-reverse"` };
+    clients.events.set(successor.id, structuredClone(reverseMaster));
+    clients.calendar.listDelta = async () => ({ items: [structuredClone(reverseMaster)], nextSyncToken: "reverse-token" });
+    const todoistWrites = clients.todoistUpserts.length;
+    await sync.process({ ...delivery, id: `cadence-matrix-calendar-reverse-${index}`, kind: "calendar", body: "",
+      receivedAt: "2026-11-27T10:03:00Z" });
+    const reversedTask = tasks.get(taskId);
+    assert.ok(reversedTask, `${item.name} Calendar reversal retains the same Todoist task`);
+    assert.ok(calendarRuleMatches(reverseMaster, todoistRecurrenceToRrule(reversedTask, {
+      start: item.nextDue, timeZone: "Europe/London",
+    })), `${item.name} Calendar edit returns to the same logical recurrence`);
+    assert.equal(state.mappingsByTask.get(taskId).masterEventId, successor.id);
+    assert.equal(state.mappingsByTask.get(taskId).activeInstanceId, `cadence-successor-${index}`);
+    const writesAfterReverse = clients.todoistUpserts.length;
+    assert.ok(writesAfterReverse > todoistWrites, `${item.name} reverse Calendar cadence writes Todoist once`);
+    await sync.process({ ...delivery, id: `cadence-matrix-calendar-reverse-replay-${index}`, kind: "calendar", body: "",
+      receivedAt: "2026-11-27T10:04:00Z" });
+    assert.equal(clients.todoistUpserts.length, writesAfterReverse,
+      `${item.name} Calendar reverse edit replay makes no unnecessary Todoist write`);
+  }
+});
+
+test("timed Europe/London cadence edit splits at the exact prior DST-crossing occurrence", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2027-03-27T12:00:00Z") });
+  const taskId = "timed-cadence-task";
+  const summary = "Sunday team handoff";
+  const master = { id: MASTER, iCalUID: SERIES, status: "confirmed", etag: '"timed-master-v1"',
+    summary, description: "Keep the event duration", location: "London",
+    start: { dateTime: "2026-03-29T09:00:00+01:00", timeZone: "Europe/London" },
+    end: { dateTime: "2026-03-29T10:00:00+01:00", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=WEEKLY"],
+    extendedProperties: { shared: { taskId, syncSeriesId: SERIES, syncProgressVersion: "1" } } };
+  const occurrence = (id, dateTime) => ({ id, status: "confirmed", recurringEventId: MASTER, iCalUID: SERIES,
+    originalStartTime: { dateTime, timeZone: "Europe/London" },
+    start: { dateTime, timeZone: "Europe/London" },
+    end: { dateTime: new Date(Date.parse(dateTime) + 3_600_000).toISOString(), timeZone: "Europe/London" },
+    summary, description: master.description });
+  const previous = occurrence("timed-previous", "2027-03-21T09:00:00Z");
+  const active = occurrence("timed-active", "2027-03-28T09:00:00+01:00");
+  const instances = [previous, active];
+  const recurrence = calendarOwnedTodoistRecurrence(master, instances, "Europe/London");
+  assert.ok(recurrence);
+  const link = { profile: PROFILE, owner: "calendar", calendarProgressVersion: 1, seriesId: SERIES,
+    masterEventId: MASTER, activeInstanceId: active.id, originalStart: active.originalStartTime.dateTime,
+    activeEffectiveStart: active.start.dateTime, taskId, eventId: active.id, syncedTitle: summary,
+    syncedDescription: master.description, updatedAt: "2027-03-27T09:00:00Z" };
+  const state = new FakeState(link);
+  const oldTask = { id: taskId, project_id: profiles[PROFILE].todoistProjectId,
+    ...calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London"),
+    updated_at: "2027-03-27T10:00:00Z" };
+  link.syncBaseline = providerSyncBaseline(oldTask, active, master);
+  state.storeMapping(mappingFromLink(link));
+  state.links[0].syncBaseline = structuredClone(link.syncBaseline);
+  const editedTask = { ...structuredClone(oldTask), due: { ...oldTask.due, string: "every 2 weeks" },
+    updated_at: "2027-03-27T10:01:00Z" };
+  const tasks = new Map([[taskId, editedTask]]);
+  const clients = fakeClients(state, instances, tasks, undefined, [master]);
+  clients.events.set(MASTER, structuredClone(master));
+  for (const event of instances) clients.events.set(event.id, structuredClone(event));
+  clients.calendar.listInstancesInWindow = async (masterId, from, to) => {
+    const event = clients.events.get(masterId);
+    if (!event) return [];
+    const until = event.recurrence?.[0]?.match(/(?:^|;)UNTIL=(\d{8}T\d{6}Z)/)?.[1];
+    const cap = until && Date.parse(`${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6, 8)}T${until.slice(9, 11)}:${until.slice(11, 13)}:${until.slice(13, 15)}Z`);
+    return instances.filter((item) => item.recurringEventId === masterId
+      && Date.parse(item.originalStartTime.dateTime) >= Date.parse(from)
+      && Date.parse(item.originalStartTime.dateTime) <= Date.parse(to)
+      && (!cap || Date.parse(item.originalStartTime.dateTime) <= cap)).map((item) => structuredClone(item));
+  };
+  clients.calendar.listExplicitSeriesExceptions = async () => [];
+  clients.calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+    assert.equal(clients.events.get(eventId).etag, etag);
+    const updated = { ...structuredClone(payload), id: eventId, etag: '"timed-master-capped"' };
+    clients.events.set(eventId, updated);
+    for (let index = instances.length - 1; index >= 0; index -= 1) {
+      if (instances[index].recurringEventId === eventId
+        && Date.parse(instances[index].originalStartTime.dateTime) > Date.parse("2027-03-21T09:00:00Z")) {
+        clients.events.delete(instances[index].id);
+        instances.splice(index, 1);
+      }
+    }
+    clients.calendarUpserts.push({ id: eventId, recurrence: structuredClone(updated.recurrence) });
+    return structuredClone(updated);
+  };
+  clients.calendar.createFutureMasterOnce = async (event) => {
+    const created = { ...structuredClone(event), status: "confirmed", etag: '"timed-successor-v1"' };
+    clients.events.set(created.id, created);
+    const start = created.start.dateTime;
+    const future = { ...occurrence("timed-successor-active", start), recurringEventId: created.id,
+      summary: created.summary, description: created.description,
+      end: structuredClone(created.end) };
+    instances.push(future);
+    clients.events.set(future.id, structuredClone(future));
+    return structuredClone(created);
+  };
+
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  const delivery = { id: "timed-dst-cadence-edit", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2027-03-27T10:02:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: editedTask,
+      event_data_extra: { update_intent: "item_updated", old_item: oldTask } }) };
+  await sync.process(delivery);
+
+  const archived = clients.events.get(MASTER);
+  assert.equal(archived.extendedProperties.shared.syncHistoryOnly, "true");
+  assert.deepEqual(archived.recurrence, ["RRULE:FREQ=WEEKLY;UNTIL=20270321T090000Z"]);
+  assert.equal(archived.start.dateTime, master.start.dateTime);
+  assert.ok(instances.some((event) => event.id === previous.id));
+  assert.equal(instances.some((event) => event.id === active.id), false);
+  const successor = [...clients.events.values()].find((event) => event.id !== MASTER
+    && event.extendedProperties?.shared?.taskId === taskId);
+  assert.ok(successor);
+  assert.deepEqual(successor.recurrence, ["RRULE:FREQ=WEEKLY;INTERVAL=2"]);
+  assert.equal(successor.start.dateTime, active.start.dateTime);
+  assert.equal(Date.parse(successor.end.dateTime) - Date.parse(successor.start.dateTime), 3_600_000);
+  assert.equal(state.mappingsByTask.get(taskId).masterEventId, successor.id);
+  assert.equal(state.mappingsByTask.get(taskId).activeInstanceId, "timed-successor-active");
+  const writes = clients.calendarUpserts.length;
+  await sync.process(delivery);
+  assert.equal(clients.calendarUpserts.length, writes);
+  assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === taskId).length, 1);
+
+  const reverseMaster = { ...successor, recurrence: ["RRULE:FREQ=WEEKLY"], etag: '"timed-successor-reverse"' };
+  clients.events.set(successor.id, structuredClone(reverseMaster));
+  clients.calendar.listDelta = async () => ({ items: [structuredClone(reverseMaster)], nextSyncToken: "timed-reverse-token" });
+  const todoistWrites = clients.todoistUpserts.length;
+  await sync.process({ ...delivery, id: "timed-dst-calendar-reverse", kind: "calendar", body: "",
+    receivedAt: "2027-03-27T10:03:00Z" });
+  const reversedTask = tasks.get(taskId);
+  assert.ok(reversedTask);
+  assert.ok(calendarRuleMatches(reverseMaster, todoistRecurrenceToRrule(reversedTask, {
+    start: active.start.dateTime, timeZone: "Europe/London",
+  })));
+  assert.equal(state.mappingsByTask.get(taskId).masterEventId, successor.id);
+  assert.equal(state.mappingsByTask.get(taskId).activeInstanceId, "timed-successor-active");
+  const writesAfterReverse = clients.todoistUpserts.length;
+  assert.ok(writesAfterReverse > todoistWrites);
+  await sync.process({ ...delivery, id: "timed-dst-calendar-reverse-replay", kind: "calendar", body: "",
+    receivedAt: "2027-03-27T10:04:00Z" });
+  assert.equal(clients.todoistUpserts.length, writesAfterReverse);
+});
+
+test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, selector and DST series", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-28T12:00:00Z") });
+  const cases = [
+    { name: "daily interval", rule: "RRULE:FREQ=DAILY;INTERVAL=2", anchor: "2023-01-01", active: "2026-11-29", next: "2026-12-01" },
+    { name: "weekly cadence", rule: "RRULE:FREQ=WEEKLY;BYDAY=WE", anchor: "2023-01-04", active: "2026-12-02", next: "2026-12-09" },
+    { name: "monthly interval", rule: "RRULE:FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15", anchor: "2023-01-15", active: "2027-01-15", next: "2027-04-15" },
+    { name: "monthly selector", rule: "RRULE:FREQ=MONTHLY;BYDAY=2TU", anchor: "2023-01-10", active: "2026-12-08", next: "2027-01-12" },
+    { name: "yearly interval selector", rule: "RRULE:FREQ=YEARLY;INTERVAL=2;BYMONTH=1;BYMONTHDAY=15", anchor: "2023-01-15", active: "2027-01-15", next: "2029-01-15" },
+    { name: "weekly London DST", rule: "RRULE:FREQ=WEEKLY",
+      anchor: "2023-03-26T09:00:00+01:00", active: "2027-03-28T09:00:00+01:00",
+      next: "2027-04-04T09:00:00+01:00", timed: true },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const at = (value, durationHours = 24) => {
+      if (!item.timed) {
+        const date = new Date(`${value}T00:00:00Z`);
+        date.setUTCDate(date.getUTCDate() + 1);
+        return { start: { date: value }, end: { date: date.toISOString().slice(0, 10) } };
+      }
+      const [, year, month, day, hour, minute, second, offset] =
+        /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})([+-]\d{2}:\d{2})$/.exec(value) || [];
+      const wallEnd = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour),
+        Number(minute), Number(second)) + durationHours * 3_600_000).toISOString().slice(0, 19);
+      return { start: { dateTime: value, timeZone: "Europe/London" },
+        end: { dateTime: `${wallEnd}${offset}`, timeZone: "Europe/London" } };
+    };
+    const anchorSpan = at(item.anchor);
+    const master = { id: MASTER, etag: `"matrix-${index}-v1"`, iCalUID: SERIES, status: "confirmed",
+      summary: `Historical ${item.name}`, description: "Original description",
+      ...anchorSpan, recurrence: [item.rule],
+      extendedProperties: { shared: { taskId: `matrix-task-${index}`, syncSeriesId: SERIES,
+        syncProgressVersion: "1" } } };
+    const activeSpan = at(item.active, 1);
+    const active = { id: `matrix-active-${index}`, status: "confirmed", recurringEventId: MASTER,
+      iCalUID: SERIES, originalStartTime: structuredClone(activeSpan.start), ...activeSpan,
+      summary: master.summary, description: master.description, etag: `"matrix-active-${index}-v1"` };
+    const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/London");
+    assert.ok(recurrence, `${item.name} recurrence projects`);
+    const payload = calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London");
+    const task = { id: `matrix-task-${index}`, project_id: profiles[PROFILE].todoistProjectId,
+      ...payload, updated_at: "2026-11-28T10:00:00Z" };
+    const value = (point) => point.dateTime || point.date;
+    const link = { ...linkFor(active, task.id), seriesId: SERIES, masterEventId: MASTER,
+      originalStart: value(active.originalStartTime), activeEffectiveStart: value(active.start),
+      syncedTitle: task.content, syncedDescription: task.description };
+    link.syncBaseline = providerSyncBaseline(task, active, master);
+    const state = new FakeState(link);
+    state.storeMapping(mappingFromLink(link));
+    state.links[0].syncBaseline = structuredClone(link.syncBaseline);
+    const tasks = new Map([[task.id, structuredClone(task)]]);
+    const seriesInstances = [active];
+    const clients = fakeClients(state, seriesInstances, tasks, undefined, [master]);
+    const calendar = clients.calendar;
+    const sync = new Synchronizer(state, undefined, async () => clients);
+    const edited = { ...task, content: `${task.content} updated`, description: "New description",
+      updated_at: "2026-11-28T10:01:00Z" };
+    tasks.set(task.id, edited);
+    const delivery = { id: `matrix-metadata-${index}`, kind: "todoist", profile: PROFILE, mode: "aws",
+      receivedAt: "2026-11-28T10:02:00Z", headers: {},
+      body: JSON.stringify({ event_name: "item:updated", event_data: edited,
+        event_data_extra: { old_item: task } }) };
+    await sync.process(delivery);
+    const storedMaster = clients.events.get(MASTER);
+    assert.equal(storedMaster.summary, edited.content, `${item.name} metadata converges to Calendar`);
+    assert.equal(storedMaster.description, edited.description);
+    assert.equal(storedMaster.start.dateTime || storedMaster.start.date, item.anchor,
+      `${item.name} historical DTSTART remains fixed`);
+    assert.deepEqual(storedMaster.recurrence, [item.rule], `${item.name} RRULE remains unchanged`);
+    const mapping = state.mappingsByTask.get(task.id);
+    assert.equal(mapping.masterEventId, MASTER);
+    assert.equal(mapping.activeInstanceId, active.id);
+    assert.equal(mapping.originalStart, value(active.originalStartTime));
+    assert.equal(mapping.activeEffectiveStart, value(active.start));
+    assert.deepEqual(mapping.syncBaseline,
+      providerSyncBaseline(edited, active, storedMaster), `${item.name} baseline follows verified metadata readback`);
+    const writes = clients.calendarUpserts.length;
+    await sync.process(delivery);
+    assert.equal(clients.calendarUpserts.length, writes, `${item.name} echo/replay does not patch again`);
+    assert.equal(state.mappingsByTask.get(task.id).masterEventId, MASTER);
+    const snapshotWrites = clients.calendarUpserts.length + clients.todoistUpserts.length;
+    const snapshot = new SnapshotReconciler(state, async () => clients, undefined, undefined, async () => ({
+      total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
+    }));
+    const snapshotResult = await snapshot.reconcile(PROFILE);
+    assert.equal(snapshotResult.counts.noop, 1, `${item.name} snapshot preserves the exact native recurrence pair`);
+    assert.equal(clients.calendarUpserts.length + clients.todoistUpserts.length, snapshotWrites,
+      `${item.name} snapshot makes no unnecessary provider writes`);
+    const nextSpan = at(item.next, 1);
+    const next = { id: `matrix-next-${index}`, status: "confirmed", recurringEventId: MASTER,
+      iCalUID: SERIES, originalStartTime: structuredClone(nextSpan.start), ...nextSpan,
+      summary: edited.content, description: edited.description, etag: `"matrix-next-${index}-v1"` };
+    seriesInstances.push(next);
+    clients.events.set(next.id, structuredClone(next));
+    if (item.timed) assert.ok(await verifiedCalendarOwnedRecurrence(master, seriesInstances, "Europe/London",
+      clients.calendar.listExplicitSeriesExceptions.bind(clients.calendar)));
+    const activeEnd = item.timed ? Date.parse(item.active) + 2 * 3_600_000
+      : Date.parse(`${item.active}T00:00:00Z`) + 36 * 3_600_000;
+    t.mock.timers.setTime(activeEnd);
+    const nextValue = value(next.start);
+    const advancedTask = { ...edited, due: { ...edited.due,
+      ...(edited.due.datetime ? { datetime: nextValue } : { date: nextValue }),
+    }, updated_at: new Date(activeEnd).toISOString() };
+    tasks.set(task.id, advancedTask);
+    const completion = { ...delivery, id: `matrix-completion-${index}`, receivedAt: new Date(activeEnd).toISOString(),
+      body: JSON.stringify({ event_name: "item:completed", event_data: edited,
+        event_data_extra: { old_item: edited } }) };
+    await sync.process(completion);
+    assert.equal(state.mappingsByTask.get(task.id).activeInstanceId, next.id,
+      `${item.name} completion advances the same mapped task to the next native instance`);
+    assert.equal(state.mappingsByTask.get(task.id).masterEventId, MASTER);
+    assert.equal(clients.events.get(MASTER).start.dateTime || clients.events.get(MASTER).start.date, item.anchor);
+    assert.deepEqual(clients.events.get(MASTER).recurrence, [item.rule]);
+
+    const rescheduledStartDate = item.timed
+      ? new Date(Date.parse(nextValue) + 24 * 3_600_000).toISOString().replace("Z", "+01:00")
+      : new Date(Date.parse(`${nextValue}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+    const rescheduledTask = { ...advancedTask, due: { ...advancedTask.due,
+      ...(advancedTask.due.datetime ? { datetime: rescheduledStartDate } : { date: rescheduledStartDate }),
+    }, updated_at: new Date(activeEnd + 60_000).toISOString() };
+    const existingInstanceWrite = calendar.upsertEventIfUnchanged;
+    calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+      const currentEvent = clients.events.get(eventId);
+      assert.equal(currentEvent?.etag, etag);
+      const updated = { ...structuredClone(payload), id: eventId, etag: `"matrix-rescheduled-${index}"` };
+      clients.events.set(eventId, updated);
+      const instanceIndex = seriesInstances.findIndex((event) => event.id === eventId);
+      if (instanceIndex >= 0) seriesInstances[instanceIndex] = structuredClone(updated);
+      clients.calendarUpserts.push({ id: eventId, payload: structuredClone(payload) });
+      return structuredClone(updated);
+    };
+    tasks.set(task.id, rescheduledTask);
+    await sync.process({ ...delivery, id: `matrix-reschedule-${index}`,
+      receivedAt: new Date(activeEnd + 120_000).toISOString(),
+      body: JSON.stringify({ event_name: "item:updated", event_data: rescheduledTask,
+        event_data_extra: { update_intent: "item_updated", old_item: advancedTask } }) });
+    assert.equal(clients.events.get(next.id).originalStartTime.dateTime || clients.events.get(next.id).originalStartTime.date,
+      nextValue, `${item.name} reschedule keeps the immutable original start`);
+    assert.equal(clients.events.get(next.id).start.dateTime || clients.events.get(next.id).start.date,
+      rescheduledStartDate, `${item.name} reschedule moves only the active occurrence`);
+    assert.deepEqual(clients.events.get(MASTER).recurrence, [item.rule]);
+    assert.equal(state.mappingsByTask.get(task.id).activeInstanceId, next.id);
+    assert.equal(state.mappingsByTask.get(task.id).originalStart, nextValue);
+    assert.equal(state.mappingsByTask.get(task.id).activeEffectiveStart, rescheduledStartDate);
+    const todoistWritesBeforeDeletion = clients.todoistUpserts.length;
+    tasks.delete(task.id);
+    await sync.process({ ...delivery, id: `matrix-delete-${index}`,
+      receivedAt: new Date(activeEnd + 180_000).toISOString(),
+      body: JSON.stringify({ event_name: "item:deleted", event_data: { ...rescheduledTask, is_deleted: true },
+        event_data_extra: { old_item: rescheduledTask } }) });
+    assert.ok(clients.calendarDeletes.includes(MASTER), `${item.name} deletion removes the exact Calendar master`);
+    assert.equal(clients.events.has(MASTER), false);
+    assert.equal(clients.projectComments.filter((comment) => comment.is_deleted !== true).length, 0,
+      `${item.name} deletion cleans the provider-native mapping`);
+    await sync.process({ ...delivery, id: `matrix-stale-completion-${index}`,
+      receivedAt: new Date(activeEnd + 240_000).toISOString(),
+      body: JSON.stringify({ event_name: "item:completed", event_data: advancedTask,
+        event_data_extra: { old_item: advancedTask } }) });
+    assert.equal(clients.todoistUpserts.length, todoistWritesBeforeDeletion,
+      `${item.name} stale completion cannot recreate the deleted task`);
+    if (existingInstanceWrite) calendar.upsertEventIfUnchanged = existingInstanceWrite;
+  }
 });
 
 test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async (t) => {
@@ -1810,7 +2566,7 @@ test("unchanged v2 one-off on moved final annual occurrence avoids correlation a
   };
   clients.projectComments.push({ id: "exact-v2", project_id: projectId,
     content: serializeMappingComment(mapping, projectId) });
-  const sync = new Synchronizer(state, undefined, async () => clients);
+    const sync = new Synchronizer(state, undefined, async () => clients);
   let crossProfileReads = 0, taskReads = 0, correlationAttempts = 0, replayVerified = 0;
   sync.providerMappingByTaskAnyProfile = async () => { crossProfileReads++; return mapping; };
   const getTask = clients.todoist.getTask.bind(clients.todoist);

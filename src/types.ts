@@ -160,6 +160,9 @@ export interface TodoistTask {
   id: string;
   content: string;
   description?: string;
+  /** Provider metadata preserved across sync updates but not used as sync identity. */
+  labels?: string[];
+  priority?: number;
   project_id?: string;
   due?: TodoistDue | null;
   url?: string;
@@ -189,6 +192,18 @@ export interface CalendarEvent {
   status?: string;
   summary?: string;
   description?: string;
+  colorId?: string;
+  location?: string;
+  visibility?: string;
+  transparency?: string;
+  attendees?: Array<Record<string, unknown>>;
+  reminders?: { useDefault?: boolean; overrides?: Array<{ method: string; minutes: number }> };
+  guestsCanInviteOthers?: boolean;
+  guestsCanModify?: boolean;
+  guestsCanSeeOtherGuests?: boolean;
+  conferenceData?: Record<string, unknown>;
+  source?: Record<string, unknown>;
+  attachments?: Array<Record<string, unknown>>;
   htmlLink?: string;
   start?: { date?: string; dateTime?: string; timeZone?: string };
   end?: { date?: string; dateTime?: string; timeZone?: string };

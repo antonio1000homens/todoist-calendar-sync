@@ -72,6 +72,25 @@ test("all-day finite weekly recurrence preserves date-only Todoist due values", 
   }, schedule[0], recurrence), true);
 });
 
+test("historical finite weekly projection preserves its remaining inclusive end bound", () => {
+  const master = { id: "finite-historical", status: "confirmed", summary: "Weekly task",
+    start: { date: "2099-09-02" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"] };
+  const schedule = [2, 9, 16, 23].map((day, index) => ({
+    id: "finite-historical-" + index, recurringEventId: master.id, status: "confirmed",
+    originalStartTime: { date: `2099-09-${String(day).padStart(2, "0")}` },
+    start: { date: `2099-09-${String(day).padStart(2, "0")}` },
+  }));
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  const payload = calendarOwnedRecurringTaskPayload(schedule[1], recurrence, "Europe/London");
+  assert.equal(payload.due.date, "2099-09-09");
+  assert.equal(payload.due.string, "every Wednesday starting 9 Sep 2099 and ending 23 Sep 2099");
+  const task = { id: "finite-projection", ...payload };
+  assert.equal(matchesCalendarOwnedRecurringTask(task, schedule[1], recurrence, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringTask({ ...task, due: { ...task.due, date: "2099-09-02" } },
+    schedule[1], recurrence, "Europe/London"), false);
+  assert.equal(recurrence.semantic.startDate, "2099-09-02");
+});
+
 test("unsupported or incomplete finite weekly recurrence inventories fail closed", () => {
   const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=DAILY;COUNT=4");
   const schedule = instances(["2026-11-04T14:00:00Z"]);
@@ -124,6 +143,34 @@ test("daily Calendar rules, including intervals, map to equivalent Todoist recur
     assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule({ ...task, due: { ...task.due, string: "every day" } }, recurrence, "Europe/London"), interval === undefined);
+  }
+});
+
+test("historical weekly, monthly, and yearly interval rules project from an active date without resetting phase", () => {
+  const cases = [
+    { rule: "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO", dates: ["2026-11-02", "2026-11-16", "2026-11-30", "2026-12-14"], phrase: "every other mon starting 16 Nov 2026" },
+    { rule: "RRULE:FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15", dates: ["2026-01-15", "2026-04-15", "2026-07-15", "2026-10-15"], phrase: "every 3 months starting 15 Apr 2026" },
+    { rule: "RRULE:FREQ=YEARLY;INTERVAL=2;BYMONTH=1;BYMONTHDAY=1", dates: ["2023-01-01", "2025-01-01", "2027-01-01", "2029-01-01"], phrase: "every 2 years starting 1 Jan 2025" },
+  ];
+  for (const example of cases) {
+    const master = { id: "interval-master", start: { date: example.dates[0] }, recurrence: [example.rule] };
+    const schedule = example.dates.map((date, index) => ({ id: `interval-${index}`, recurringEventId: master.id,
+      status: "confirmed", originalStartTime: { date }, start: { date } }));
+    assert.equal(nativeCalendarRecurrenceCandidate(master), true, example.rule);
+    const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+    assert.ok(recurrence, example.rule);
+    const active = schedule[1];
+    const payload = calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London");
+    assert.equal(payload.due.string, example.phrase);
+    const task = { id: "interval-task", ...payload };
+    assert.equal(matchesCalendarOwnedRecurringTask(task, active, recurrence, "Europe/London"), true,
+      `${example.rule}: ${JSON.stringify(calendarOwnedRecurringTaskReadback(task, active, recurrence, "Europe/London"))}`);
+    for (const occurrence of schedule.slice(1)) {
+      const advanced = { ...task, due: { ...task.due, date: occurrence.start.date } };
+      assert.equal(matchesCalendarOwnedRecurringTask(advanced, occurrence, recurrence, "Europe/London"), true,
+        `${example.rule} at ${occurrence.start.date}`);
+    }
+    assert.equal(recurrence.semantic.startDate, example.dates[0], "the immutable RRULE anchor remains unchanged");
   }
 });
 
@@ -195,7 +242,6 @@ test("complex or finite non-weekly Calendar recurrences are never silently appro
     ["2026-11-15", "RRULE:FREQ=MONTHLY;UNTIL=20271231"],
     ["2028-02-29", "RRULE:FREQ=YEARLY"],
     ["2026-11-04", "RRULE:FREQ=WEEKLY;BYDAY=WE,FR"],
-    ["2026-11-04", "RRULE:FREQ=WEEKLY;INTERVAL=2"],
     ["2026-11-04", "RRULE:FREQ=WEEKLY;BYSETPOS=1"],
     ["2026-11-15", "RRULE:FREQ=MONTHLY;BYDAY=3SU"],
   ];
@@ -534,3 +580,50 @@ test("weekly weekday lists translate through the shared RRULE semantics", async 
   const task = { id: "weekday-list-task", due: { date: "2026-11-25", is_recurring: true, string: recurrence.dueString } };
   assert.equal(matchesCalendarOwnedRecurringTask(task, schedule[1], recurrence, "Europe/London"), true);
 });
+
+
+// #551: the provider honors the recurrence expression's starting clause
+// rather than the separately supplied due.date. Exercise both boundaries.
+for (const example of [
+  { name: "annual production reproduction", rule: "RRULE:FREQ=YEARLY",
+    dates: ["2026-01-01", "2027-01-01", "2028-01-01", "2029-01-01"], phrase: "1 Jan 2027" },
+  { name: "daily interval", rule: "RRULE:FREQ=DAILY;INTERVAL=3",
+    dates: ["2026-11-21", "2026-11-24", "2026-11-27", "2026-11-30"], phrase: "24 Nov 2026" },
+  { name: "weekly", rule: "RRULE:FREQ=WEEKLY;BYDAY=MO",
+    dates: ["2026-11-16", "2026-11-23", "2026-11-30", "2026-12-07"], phrase: "23 Nov 2026" },
+  { name: "monthly", rule: "RRULE:FREQ=MONTHLY",
+    dates: ["2026-10-15", "2026-11-15", "2026-12-15", "2027-01-15"], phrase: "15 Nov 2026" },
+  { name: "monthly ordinal", rule: "RRULE:FREQ=MONTHLY;BYDAY=2MO",
+    dates: ["2026-10-12", "2026-11-09", "2026-12-14", "2027-01-11"], phrase: "9 Nov 2026" },
+  { name: "alternate weekly", rule: "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO",
+    dates: ["2026-11-02", "2026-11-16", "2026-11-30", "2026-12-14"], phrase: "16 Nov 2026" },
+  { name: "monthly interval", rule: "RRULE:FREQ=MONTHLY;INTERVAL=3",
+    dates: ["2026-01-15", "2026-04-15", "2026-07-15", "2026-10-15"], phrase: "15 Apr 2026" },
+]) {
+  test("#551: historical " + example.name + " projection preserves master cadence", () => {
+    const master = { id: "historical", status: "confirmed",
+      start: { date: example.dates[0] }, recurrence: [example.rule] };
+    const schedule = example.dates.map((date, index) => ({
+      id: "historical-" + index, recurringEventId: master.id, status: "confirmed",
+      originalStartTime: { date }, start: { date },
+    }));
+    const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+    assert.ok(recurrence, example.name);
+    const active = schedule[1];
+    const payload = calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London");
+    assert.equal(payload.due.date, example.dates[1]);
+    assert.ok(payload.due.string.endsWith("starting " + example.phrase), payload.due.string);
+    assert.equal(recurrence.startDate, example.dates[0], "master anchor stays immutable");
+    // Readback models Todoist interpreting the generated starting clause.
+    const task = { id: "task", ...payload };
+    assert.equal(matchesCalendarOwnedRecurringTask(task, active, recurrence, "Europe/London"), true);
+    assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
+    const advanced = { ...task, due: { ...task.due, date: example.dates[2] } };
+    assert.equal(matchesCalendarOwnedRecurringTask(advanced, schedule[2], recurrence, "Europe/London"), true,
+      "completion advancement retains original Calendar phase and projected start");
+    assert.equal(matchesCalendarOwnedRecurringTask({ ...task, due: { ...task.due, date: example.dates[0] } },
+      active, recurrence, "Europe/London"), false, "historical provider due must not pass readback");
+    assert.deepEqual(master.start, { date: example.dates[0] });
+    assert.deepEqual(master.recurrence, [example.rule]);
+  });
+}

@@ -1,7 +1,7 @@
 import { normalizedText } from "./security.js";
 import {
   classifyCalendarRule, classifyTodoistRule, compareOccurrenceSemantics, recurrenceCadenceMatchesAtDate,
-  recurrenceCivilAnchor,
+  recurrenceCivilAnchor, recurrenceStartBoundaryMatches, parseTodoistStartBoundary,
 } from "./recurrence-semantics.js";
 import type { CalendarEvent, TodoistTask } from "./types.js";
 
@@ -42,9 +42,12 @@ export function todoistRecurrenceKey(task: TodoistTask): string | undefined {
  * form `every week 09:30`.
  */
 export function todoistRecurrenceToRrule(task: TodoistTask, anchor?: { start: string; timeZone?: string }): string | undefined {
-  const key = todoistRecurrenceKey(task);
+  const rawKey = todoistRecurrenceKey(task);
   const start = task.due?.datetime || task.due?.date;
-  if (!key || !start || /\b(until|starting|ending)\b/.test(key)) return undefined;
+  if (!rawKey || !start || /\b(until|ending)\b/.test(rawKey)) return undefined;
+  const projection = parseTodoistStartBoundary(rawKey);
+  if (projection.invalid) return undefined;
+  const key = projection.expression;
   // Todoist's "every other Monday" idiom remains Phase B gated until its
   // completion progression has been verified from provider readback.
   if (/^every other (?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)$/i.test(key)) return undefined;
@@ -57,6 +60,11 @@ export function todoistRecurrenceToRrule(task: TodoistTask, anchor?: { start: st
   // provider anchor and a parseable, non-bounded rule can become an RRULE.
   const context = anchor || { start, timeZone: task.due?.timezone };
   const classified = classifyTodoistRule(key, context);
+  if (projection.hasBoundary && (!anchor || !classified.semantic)) return undefined;
+  if (projection.hasBoundary && anchor) {
+    const dueDate = recurrenceCivilAnchor(start, anchor.timeZone || task.due?.timezone)?.date;
+    if (!dueDate || !recurrenceStartBoundaryMatches(projection, classified.semantic!, dueDate)) return undefined;
+  }
   if (!anchor && classified.semantic?.localTime) {
     const dueAnchor = recurrenceCivilAnchor(start, task.due?.timezone);
     if (!dueAnchor || dueAnchor.time !== classified.semantic.localTime) return undefined;
@@ -76,19 +84,23 @@ export function calendarRecurrenceMatchesTodoist(event: {
   start?: { date?: string; dateTime?: string; timeZone?: string };
   extendedProperties?: { shared?: Record<string, string> };
 }, task: TodoistTask): boolean {
-  const key = todoistRecurrenceKey(task);
-  if (!key) return !event.recurrence?.length;
+  const rawKey = todoistRecurrenceKey(task);
+  if (!rawKey) return !event.recurrence?.length;
+  const key = parseTodoistStartBoundary(rawKey);
+  if (key.invalid) return false;
   const todoistStart = task.due?.datetime || task.due?.date;
   const calendarStart = event.start?.dateTime || event.start?.date;
   const zone = event.start?.timeZone || task.due?.timezone;
   if (!todoistStart || !calendarStart || !hasSingleRrule(event.recurrence)) return false;
-  const todoist = classifyTodoistRule(key, { start: todoistStart, timeZone: zone }).semantic;
+  const todoist = classifyTodoistRule(key.expression, { start: todoistStart, timeZone: zone }).semantic;
   const dueDate = recurrenceCivilAnchor(todoistStart, zone)?.date;
   if (!todoist || !dueDate || !event.recurrence?.length) return false;
   const calendar = classifyCalendarRule(event.recurrence![0], { start: calendarStart, timeZone: zone }).semantic;
-  const compatible = Boolean(calendar && recurrenceCadenceMatchesAtDate(calendar, todoist, dueDate));
+  const projectedStartMatches = Boolean(calendar && recurrenceStartBoundaryMatches(key, calendar, dueDate));
+  const compatible = Boolean(calendar && recurrenceCadenceMatchesAtDate(calendar, todoist, dueDate)
+    && projectedStartMatches);
   return compatible && (!event.extendedProperties?.shared?.todoistRecurrence
-    || event.extendedProperties.shared.todoistRecurrence === key);
+    || event.extendedProperties.shared.todoistRecurrence === rawKey);
 }
 
 /** Compare a provider RRULE readback to an expected rule using the shared

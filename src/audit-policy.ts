@@ -54,11 +54,14 @@ export function auditExpiresAt(nowMs = Date.now()): number {
 }
 
 
-/** Only these recurring snapshot conflicts are collapsed while the same
- * provider state remains unresolved. Their CloudWatch observations are never deduplicated. */
+/** Only these recurrence conflicts are collapsed while the same provider
+ * state remains unresolved. Their CloudWatch observations are never deduplicated. */
 const DEDUPED_CONFLICT_ACTIONS = new Set([
   "todoist_snapshot_reconcile_unmapped_conflict",
   "todoist_snapshot_reconcile_cancelled_projection_blocked",
+  "calendar_owned_todoist_recurrence_requires_review",
+  "calendar_owned_todoist_date_edit_requires_review",
+  "calendar_recurrence_todoist_moved_occurrence_requires_review",
 ]);
 
 /**
@@ -89,12 +92,12 @@ export function retainedConflictEntity(detail: Record<string, unknown>): string 
 
 export function retainedConflictIdentity(action: string, detail: Record<string, unknown>): string | undefined {
   if (!DEDUPED_CONFLICT_ACTIONS.has(action) || !retainedConflictEntity(detail)) return undefined;
-  // Only collapse observations when the producer supplies provider versions
-  // for both sides. Candidate-only conflicts do not have revision data, so
-  // their identity is not strong enough to distinguish changed state.
-  if (typeof detail.taskUpdatedAt !== "string" || !detail.taskUpdatedAt
-    || (typeof detail.calendarUpdatedAt !== "string" || !detail.calendarUpdatedAt)
-      && (typeof detail.calendarEtag !== "string" || !detail.calendarEtag)) return undefined;
+  // Collapse paired conflicts only when both providers have versions. A
+  // pre-task Calendar import conflict can instead key on its event version.
+  const calendarVersioned = (typeof detail.calendarUpdatedAt === "string" && Boolean(detail.calendarUpdatedAt))
+    || (typeof detail.calendarEtag === "string" && Boolean(detail.calendarEtag));
+  if (!calendarVersioned || (action !== "calendar_recurrence_todoist_moved_occurrence_requires_review"
+    && (typeof detail.taskUpdatedAt !== "string" || !detail.taskUpdatedAt))) return undefined;
   if (action === "todoist_snapshot_reconcile_unmapped_conflict"
     && (!Array.isArray(detail.mismatchCategories) || detail.mismatchCategories.length === 0)) return undefined;
   const ids = (field: string): string[] => Array.isArray(detail[field])

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, sameSafeYearlyRecurrenceRule,
+  sameSafeFutureRecurrenceRule,
 } from "../dist/recurrence-split.js";
 
 const task = () => ({
@@ -90,8 +91,8 @@ test("archived master cannot be silently claimed for a different Todoist task or
 });
 
 test("split refuses unsupported RRULEs, timed events and already elapsed first new dates", () => {
-  for (const rrule of ["RRULE:FREQ=MONTHLY", "RRULE:FREQ=YEARLY;COUNT=30",
-    "RRULE:FREQ=YEARLY;BYMONTH=5", "RRULE:FREQ=YEARLY;INTERVAL=1;EXDATE=20250503"]) {
+  for (const rrule of ["RRULE:FREQ=DAILY;COUNT=30", "RRULE:FREQ=YEARLY;COUNT=30",
+    "RRULE:FREQ=YEARLY;BYDAY=1MO", "RRULE:FREQ=YEARLY;INTERVAL=1;EXDATE=20250503"]) {
     const e = old();
     e.recurrence = [rrule];
     assert.throws(() => planFutureSeriesSplit("antonio", task(), e, new Date("2026-10-19T12:00:00Z")));
@@ -102,6 +103,68 @@ test("split refuses unsupported RRULEs, timed events and already elapsed first n
   const overdue = task();
   overdue.due.date = "2024-07-01";
   assert.throws(() => planFutureSeriesSplit("antonio", overdue, old(), new Date("2026-10-19T12:00:00Z")));
+});
+
+test("future-only split preserves the last real occurrence for supported all-day cadences", () => {
+  const cases = [
+    { rule: "RRULE:FREQ=DAILY;INTERVAL=2", start: "2024-01-01", due: "2026-11-29",
+      dueString: "every Sunday", next: "2026-11-28", prior: "2026-11-26", newRule: "RRULE:FREQ=WEEKLY;BYDAY=SU" },
+    { rule: "RRULE:FREQ=WEEKLY;BYDAY=WE", start: "2024-01-03", due: "2026-12-02",
+      dueString: "every 2 weeks", next: "2026-12-02", prior: "2026-11-25", newRule: "RRULE:FREQ=WEEKLY;INTERVAL=2" },
+    { rule: "RRULE:FREQ=MONTHLY;BYDAY=2TU", start: "2024-01-09", due: "2026-12-08",
+      dueString: "every 2 months", next: "2026-12-08", prior: "2026-11-10", newRule: "RRULE:FREQ=MONTHLY;INTERVAL=2" },
+  ];
+  for (const item of cases) {
+    const source = task();
+    source.due = { date: item.due, is_recurring: true, string: item.dueString };
+    const master = old();
+    master.start = { date: item.start };
+    master.end = { date: new Date(Date.parse(item.start + "T00:00:00Z") + 86400000).toISOString().slice(0, 10) };
+    master.recurrence = [item.rule];
+    const p = planFutureSeriesSplit("antonio", source, master, new Date("2026-11-28T12:00:00Z"));
+    assert.equal(p.previousOccurrence, item.prior, item.rule);
+    assert.equal(p.nextOldOccurrence, item.next, item.rule);
+    assert.equal(p.truncatedRule, `${item.rule};UNTIL=${item.prior.replace(/-/g, "")}`, item.rule);
+    assert.equal(p.newRule, item.newRule, item.rule);
+  }
+});
+
+test("timed future-only split cuts the old RRULE at the exact pre-DST occurrence instant", () => {
+  const master = { id: "london-weekly-master", iCalUID: "london-weekly-series", status: "confirmed",
+    etag: '"london-master-v1"', summary: task().content,
+    start: { dateTime: "2026-03-29T09:00:00+01:00", timeZone: "Europe/London" },
+    end: { dateTime: "2026-03-29T10:00:00+01:00", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=WEEKLY"],
+    extendedProperties: { shared: { taskId: task().id, syncSeriesId: "london-weekly-series" } } };
+  const timedTask = { ...task(), due: { datetime: "2027-03-28T09:00:00+01:00", timezone: "Europe/London",
+    is_recurring: true, string: "every 2 weeks" } };
+  const plan = planFutureSeriesSplit("antonio", timedTask, master,
+    new Date("2027-03-27T12:00:00Z"), "Europe/London", undefined, "london-weekly-series");
+  assert.equal(plan.previousOccurrence, "2027-03-21T09:00:00.000Z");
+  assert.equal(plan.nextOldOccurrence, "2027-03-28");
+  assert.equal(plan.truncatedRule, "RRULE:FREQ=WEEKLY;UNTIL=20270321T090000Z");
+  assert.equal(plan.newRule, "RRULE:FREQ=WEEKLY;INTERVAL=2");
+  assert.equal(plan.newStart, timedTask.due.datetime);
+  assert.equal(sameSafeFutureRecurrenceRule(plan.truncatedRule, "RRULE:UNTIL=20270321T090000Z;FREQ=WEEKLY",
+    master.start.dateTime, "Europe/London"), true);
+  assert.equal(sameSafeFutureRecurrenceRule(plan.truncatedRule, "RRULE:FREQ=WEEKLY;INTERVAL=2;UNTIL=20270321T090000Z",
+    master.start.dateTime, "Europe/London"), false);
+});
+
+test("timed future-only split rejects ambiguous local wall times", () => {
+  const makePlan = (start, due) => {
+    const master = { id: "london-wall-time-master", iCalUID: "london-wall-time-series", status: "confirmed",
+      etag: '"london-wall-time-v1"', summary: task().content,
+      start: { dateTime: start, timeZone: "Europe/London" },
+      end: { dateTime: new Date(Date.parse(start) + 3_600_000).toISOString(), timeZone: "Europe/London" },
+      recurrence: ["RRULE:FREQ=WEEKLY"],
+      extendedProperties: { shared: { taskId: task().id, syncSeriesId: "london-wall-time-series" } } };
+    const timedTask = { ...task(), due: { datetime: due, timezone: "Europe/London",
+      is_recurring: true, string: "every 2 weeks" } };
+    return () => planFutureSeriesSplit("antonio", timedTask, master,
+      new Date("2027-03-27T12:00:00Z"), "Europe/London", undefined, "london-wall-time-series");
+  };
+  assert.throws(makePlan("2026-10-25T01:30:00+01:00", "2027-03-28T09:00:00+01:00"), /missing or ambiguous/);
 });
 
 test("old modified, cancelled or missing historical instances require operator review", () => {
@@ -173,7 +236,7 @@ test("expired UNTIL after DTSTART verifies actual history and preserves the old 
 test("unsupported or ambiguous expiry clauses fail closed with actionable guidance", () => {
   for (const rule of [
     "RRULE:FREQ=YEARLY;COUNT=3", "RRULE:FREQ=YEARLY;RDATE=20270502",
-    "RRULE:FREQ=YEARLY;EXDATE=20250502", "RRULE:FREQ=YEARLY;UNTIL=20231231;BYMONTH=5",
+    "RRULE:FREQ=YEARLY;EXDATE=20250502", "RRULE:FREQ=YEARLY;UNTIL=20231231;BYDAY=1MO",
     "RRULE:FREQ=YEARLY;UNTIL=20231231T000000Z", "RRULE:FREQ=YEARLY;UNTIL=20231231;UNTIL=20231231",
   ]) {
     const master = old(); master.recurrence = [rule];

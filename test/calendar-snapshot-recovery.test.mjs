@@ -279,6 +279,54 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
   assert.equal(state.mappings[0].seriesId, master.iCalUID || master.id);
 });
 
+test("finite historical import rolls back a first readback mismatch and succeeds on fresh processing", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-27T12:00:00Z") });
+  const master = { id: "finite-history-master", iCalUID: "finite-history-series", status: "confirmed",
+    summary: "Historical weekly task", description: "Keep this description",
+    start: { date: "2026-10-30" }, end: { date: "2026-10-31" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=8"], etag: '"finite-history-v1"' };
+  const occurrences = ["2026-10-30", "2026-11-06", "2026-11-13", "2026-11-20",
+    "2026-11-27", "2026-12-04", "2026-12-11", "2026-12-18"].map((date, index) => ({
+    id: `finite-history-${index}`, status: "confirmed", summary: master.summary,
+    description: master.description, recurringEventId: master.id, iCalUID: master.iCalUID,
+    originalStartTime: { date }, start: { date },
+    end: { date: new Date(Date.parse(`${date}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10) },
+  }));
+  const state = fakeState();
+  const clients = fakeClients([master]);
+  clients.pair.calendar.listInstances = async () => occurrences.map((event) => structuredClone(event));
+  clients.pair.calendar.listExplicitSeriesExceptions = async () => [];
+  let createAttempt = 0;
+  let breakFirstReadback = true;
+  clients.pair.todoist.upsertTask = async (payload) => {
+    createAttempt += 1;
+    const created = { id: `finite-provisional-${createAttempt}`, project_id: profiles.home.todoistProjectId, ...structuredClone(payload) };
+    if (breakFirstReadback) created.due.string = "every Friday";
+    return structuredClone(created);
+  };
+
+  const failed = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(failed.imported, 0);
+  assert.equal(failed.conflicts, 1);
+  assert.equal(clients.tasks.length, 0);
+  assert.equal(clients.deletions, 1);
+  assert.equal(clients.projectComments.length, 0);
+  assert.equal(state.mappings.length, 0, "no mapping is committed before recurrence readback verifies");
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_readback_mismatch"));
+
+  breakFirstReadback = false;
+  const recovered = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(recovered.imported, 1);
+  assert.equal(recovered.conflicts, 0);
+  assert.ok(clients.tasks.length > 0);
+  assert.ok(clients.tasks.every((task) => task.id === "finite-provisional-2"));
+  assert.equal(clients.tasks[0].id, "finite-provisional-2");
+  assert.equal(clients.tasks[0].due.string, "every Friday starting 27 Nov 2026 and ending 18 Dec 2026");
+  assert.equal(state.mappings.length, 1);
+  assert.equal(state.mappings[0].taskId, "finite-provisional-2");
+  assert.equal(state.mappings[0].masterEventId, master.id);
+});
+
 
 test("snapshot import creates one native recurring Todoist task for indefinite weekly, monthly and yearly series", async () => {
   const cases = [
@@ -513,6 +561,152 @@ test("snapshot recovery imports an all-day finite recurrence using the verified 
   assert.equal(tasks[0].due.string, "every Wednesday starting 2 Sep and ending 23 Sep");
   assert.equal(state.mappings[0].taskId, "all-day-task");
   assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_readback_mismatch"), false);
+});
+
+test("snapshot recovery projects a historical annual master from its next eligible occurrence", async () => {
+  const master = {
+    id: "historical-annual-master", iCalUID: "historical-annual-series", status: "confirmed",
+    summary: "Annual review", description: "Keep the original series history",
+    start: { date: "2026-01-01" }, end: { date: "2026-01-02" }, recurrence: ["RRULE:FREQ=YEARLY"],
+  };
+  const dates = ["2026-01-01", "2027-01-01", "2028-01-01", "2029-01-01", "2030-01-01"];
+  const occurrences = dates.map((date, index) => ({
+    id: `historical-annual-${index}`, status: "confirmed", recurringEventId: master.id,
+    originalStartTime: { date }, start: { date }, end: { date: `${date.slice(0, 4)}-01-02` },
+  }));
+  const state = fakeState();
+  const tasks = [];
+  const clients = {
+    calendar: {
+      async listDelta() { return { items: [master] }; },
+      async listInstancesInWindow() { return occurrences; },
+      async listExplicitSeriesExceptions() { return []; },
+      async getTimeZone() { return "Europe/London"; },
+    },
+    todoist: {
+      async listProjectComments() { return []; },
+      async listTasks() { return tasks.map((task) => structuredClone(task)); },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask(payload) {
+        // Model Todoist honoring the explicit recurrence start, independently
+        // of the structured due value included in the create request.
+        const starting = payload.due.string.match(/\bstarting\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})$/);
+        assert.ok(starting, payload.due.string);
+        const month = new Map([["Jan", "01"], ["Feb", "02"], ["Mar", "03"], ["Apr", "04"], ["May", "05"], ["Jun", "06"],
+          ["Jul", "07"], ["Aug", "08"], ["Sep", "09"], ["Oct", "10"], ["Nov", "11"], ["Dec", "12"]]).get(starting[2]);
+        const providerDue = `${starting[3]}-${month}-${starting[1].padStart(2, "0")}`;
+        const task = { id: "historical-annual-task", ...structuredClone(payload),
+          due: { ...structuredClone(payload.due), date: providerDue } };
+        tasks.push(task);
+        return structuredClone(task);
+      },
+      async deleteTask(id) { const index = tasks.findIndex((task) => task.id === id); if (index >= 0) tasks.splice(index, 1); },
+      async findComment() { return undefined; },
+      async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-11-27T12:00:00Z");
+  try {
+    const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+    assert.equal(summary.imported, 1);
+    assert.equal(summary.conflicts, 0);
+  } finally {
+    Date.now = originalNow;
+  }
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].due.date, "2027-01-01");
+  assert.equal(tasks[0].due.is_recurring, true);
+  assert.match(tasks[0].due.string, /starting 1 Jan 2027$/);
+  assert.equal(state.mappings.length, 1);
+  assert.equal(state.mappings[0].eventId, master.id);
+  assert.equal(state.mappings[0].activeInstanceId, "historical-annual-1");
+  assert.equal(state.mappings[0].originalStart, "2027-01-01");
+  assert.equal(state.completedProjections.length, 0, "the historical occurrence is not fabricated as a completion");
+  assert.equal(master.start.date, "2026-01-01", "the Calendar DTSTART remains unchanged");
+});
+
+test("snapshot recovery projects a finite historical weekly series without resetting its final occurrence", async () => {
+  const master = { id: "historical-finite-master", iCalUID: "historical-finite-series",
+    status: "confirmed", summary: "Weekly review", description: "",
+    start: { date: "2026-10-30" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=8"] };
+  const dates = ["2026-10-30", "2026-11-06", "2026-11-13", "2026-11-20",
+    "2026-11-27", "2026-12-04", "2026-12-11", "2026-12-18"];
+  const occurrences = dates.map((date, index) => ({ id: "historical-finite-" + index,
+    status: "confirmed", recurringEventId: master.id, originalStartTime: { date }, start: { date },
+    end: { date: new Date(Date.parse(date + "T00:00:00Z") + 86_400_000).toISOString().slice(0, 10) } }));
+  const state = fakeState(), tasks = [];
+  const clients = {
+    calendar: { async listDelta() { return { items: [master] }; }, async listInstances() { return occurrences; },
+      async getTimeZone() { return "Europe/London"; } },
+    todoist: {
+      async listProjectComments() { return []; }, async listTasks() { return tasks; },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask(payload, existingId) {
+        const start = /\bstarting\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/i.exec(payload.due.string);
+        assert.ok(start, payload.due.string);
+        const months = new Map("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ")
+          .map((month, index) => [month.toLowerCase(), String(index + 1).padStart(2, "0")]));
+        const task = { id: existingId || "historical-finite-task", ...structuredClone(payload),
+          due: { ...structuredClone(payload.due), date: start[3] + "-" + months.get(start[2].toLowerCase()) + "-" + start[1].padStart(2, "0") } };
+        if (existingId) {
+          const index = tasks.findIndex((candidate) => candidate.id === task.id);
+          if (index >= 0) tasks[index] = task;
+        }
+        return structuredClone(task);
+      },
+      async deleteTask() {}, async findComment() { return undefined; }, async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-11-27T12:00:00Z");
+  try {
+    const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+    assert.equal(summary.imported, 1);
+    assert.equal(summary.conflicts, 0);
+  } finally { Date.now = originalNow; }
+  assert.equal(tasks.length, 1, JSON.stringify(tasks));
+  assert.equal(tasks.at(-1).due.date, "2026-11-27");
+  assert.equal(tasks.at(-1).due.string, "every Friday starting 27 Nov 2026 and ending 18 Dec 2026");
+  assert.equal(state.mappings[0].activeInstanceId, "historical-finite-4");
+  assert.equal(master.start.date, "2026-10-30");
+});
+
+test("snapshot recovery raises one actionable conflict for a moved active finite occurrence without creating a task", async () => {
+  const master = { id: "moved-finite-master", iCalUID: "moved-finite-series",
+    status: "confirmed", summary: "Weekly review", description: "",
+    start: { date: "2026-10-30" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=8"], etag: '"master-v1"' };
+  const dates = ["2026-10-30", "2026-11-06", "2026-11-13", "2026-11-20",
+    "2026-11-27", "2026-12-04", "2026-12-11", "2026-12-18"];
+  const occurrences = dates.map((date, index) => ({ id: "moved-finite-" + index,
+    status: "confirmed", recurringEventId: master.id, originalStartTime: { date },
+    start: { date: index === 4 ? "2026-11-28" : date },
+    end: { date: new Date(Date.parse((index === 4 ? "2026-11-28" : date) + "T00:00:00Z")
+      + 86_400_000).toISOString().slice(0, 10) }, etag: '"instance-v1"' }));
+  const state = fakeState(), tasks = [];
+  let creates = 0;
+  const clients = {
+    calendar: { async listDelta() { return { items: [master] }; }, async listInstances() { return occurrences; },
+      async getTimeZone() { return "Europe/London"; } },
+    todoist: {
+      async listProjectComments() { return []; }, async listTasks() { return tasks; },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask() { creates += 1; throw new Error("moved finite occurrence must not create a projection"); },
+      async deleteTask() {}, async findComment() { return undefined; }, async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-11-27T12:00:00Z");
+  try {
+    const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+    assert.equal(summary.conflicts, 1);
+    assert.equal(summary.imported, 0);
+  } finally { Date.now = originalNow; }
+  assert.equal(creates, 0);
+  assert.equal(tasks.length, 0);
+  const alert = state.audits.find((item) => item.action === "calendar_recurrence_todoist_moved_occurrence_requires_review");
+  assert.equal(alert.detail.eventId, "moved-finite-4");
+  assert.equal(alert.detail.masterEventId, master.id);
 });
 
 test("all-day recurrence timezone mismatch fails closed before Todoist or mapping writes", async () => {
