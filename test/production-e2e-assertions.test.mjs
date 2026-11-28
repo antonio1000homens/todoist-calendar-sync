@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   calendarResourceAbsent,
+  calendarOwnedRecurrenceCorrelationMatches,
   uniqueProjectEventMapping,
   uniqueProjectTaskMapping,
   uniqueProjectTaskMappingForEvent,
@@ -12,6 +13,22 @@ test("Calendar cleanup treats cancelled resources as deleted", () => {
   assert.equal(calendarResourceAbsent(undefined), true);
   assert.equal(calendarResourceAbsent({ status: "cancelled" }), true);
   assert.equal(calendarResourceAbsent({ status: "confirmed" }), false);
+});
+
+test("Calendar recurrence correlation uses the active occurrence and explicit master link", () => {
+  const event = { extendedProperties: { shared: {
+    taskId: "task-1", syncTaskId: "task-1", syncProfile: "antonio", syncCalendarId: "calendar",
+    syncEventId: "master-1", syncMasterEventId: "master-1", syncActiveInstanceId: "instance-1",
+    syncProgressVersion: "1",
+  } } };
+  const mapping = { profile: "antonio", calendarId: "calendar", masterEventId: "master-1",
+    eventId: "instance-1", activeInstanceId: "instance-1", taskId: "task-1", calendarProgressVersion: 1 };
+  assert.equal(calendarOwnedRecurrenceCorrelationMatches({
+    event, mapping, profile: "antonio", calendarId: "calendar", masterEventId: "master-1",
+  }), true);
+  assert.equal(calendarOwnedRecurrenceCorrelationMatches({
+    event, mapping: { ...mapping, eventId: "master-1" }, profile: "antonio", calendarId: "calendar", masterEventId: "master-1",
+  }), false, "the stored event ID must be the active instance");
 });
 
 const rule = "RRULE:FREQ=MONTHLY;BYDAY=MO,TU;BYSETPOS=1";
